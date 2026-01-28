@@ -312,14 +312,14 @@
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
-    <Import Project="..\packages\Microsoft.Windows.ImplementationLibrary.1.0.250325.1\build\native\Microsoft.Windows.ImplementationLibrary.targets" Condition="Exists('..\packages\Microsoft.Windows.ImplementationLibrary.1.0.250325.1\build\native\Microsoft.Windows.ImplementationLibrary.targets')" />
-    <Import Project="..\packages\KNSoft.SlimDetours.1.1.4-beta\build\KNSoft.SlimDetours.targets" Condition="Exists('..\packages\KNSoft.SlimDetours.1.1.4-beta\build\KNSoft.SlimDetours.targets')" />
+    <Import Project="Q:\NuGetPackages\Microsoft.Windows.ImplementationLibrary.1.0.250325.1\build\native\Microsoft.Windows.ImplementationLibrary.targets" Condition="Exists('Q:\NuGetPackages\Microsoft.Windows.ImplementationLibrary.1.0.250325.1\build\native\Microsoft.Windows.ImplementationLibrary.targets')" />
+    <Import Project="Q:\NuGetPackages\KNSoft.SlimDetours.1.1.4-beta\build\KNSoft.SlimDetours.targets" Condition="Exists('Q:\NuGetPackages\KNSoft.SlimDetours.1.1.4-beta\build\KNSoft.SlimDetours.targets')" />
   </ImportGroup>
   <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">
     <PropertyGroup>
       <ErrorText>This project references NuGet package(s) that are missing on this computer. Use NuGet Package Restore to download them.  For more information, see http://go.microsoft.com/fwlink/?LinkID=322105. The missing file is {0}.</ErrorText>
     </PropertyGroup>
-    <Error Condition="!Exists('..\packages\Microsoft.Windows.ImplementationLibrary.1.0.250325.1\build\native\Microsoft.Windows.ImplementationLibrary.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\packages\Microsoft.Windows.ImplementationLibrary.1.0.250325.1\build\native\Microsoft.Windows.ImplementationLibrary.targets'))" />
-    <Error Condition="!Exists('..\packages\KNSoft.SlimDetours.1.1.4-beta\build\KNSoft.SlimDetours.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\packages\KNSoft.SlimDetours.1.1.4-beta\build\KNSoft.SlimDetours.targets'))" />
+    <Error Condition="!Exists('Q:\NuGetPackages\Microsoft.Windows.ImplementationLibrary.1.0.250325.1\build\native\Microsoft.Windows.ImplementationLibrary.targets')" Text="$([System.String]::Format('$(ErrorText)', 'Q:\NuGetPackages\Microsoft.Windows.ImplementationLibrary.1.0.250325.1\build\native\Microsoft.Windows.ImplementationLibrary.targets'))" />
+    <Error Condition="!Exists('Q:\NuGetPackages\KNSoft.SlimDetours.1.1.4-beta\build\KNSoft.SlimDetours.targets')" Text="$([System.String]::Format('$(ErrorText)', 'Q:\NuGetPackages\KNSoft.SlimDetours.1.1.4-beta\build\KNSoft.SlimDetours.targets'))" />
   </Target>
 </Project>

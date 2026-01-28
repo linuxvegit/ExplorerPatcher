@@ -59,6 +59,53 @@ DWORD32 global_ubr;
 #pragma comment(lib, "Userenv.lib")
 #endif
 
+// GDI+ flat API declarations for anti-aliased drawing
+#pragma comment(lib, "Gdiplus.lib")
+typedef float REAL;
+typedef struct { REAL X, Y, Width, Height; } RectF;
+typedef void GpGraphics;
+typedef void GpSolidFill;
+typedef void GpFont;
+typedef void GpFontFamily;
+typedef void GpStringFormat;
+typedef void GpBitmap;
+typedef int GpStatus;
+enum { Ok = 0 };
+enum { SmoothingModeAntiAlias = 4, SmoothingModeHighQuality = 2 };
+enum { TextRenderingHintAntiAliasGridFit = 3 };
+enum { FontStyleBold = 1 };
+enum { UnitPixel = 2 };
+enum { StringAlignmentCenter = 1 };
+enum { PixelFormat32bppPARGB = 0x000E200B };  // Premultiplied ARGB
+enum { CompositingModeSourceOver = 0 };
+
+GpStatus WINAPI GdipCreateFromHDC(HDC, GpGraphics**);
+GpStatus WINAPI GdipDeleteGraphics(GpGraphics*);
+GpStatus WINAPI GdipSetSmoothingMode(GpGraphics*, int);
+GpStatus WINAPI GdipCreateSolidFill(DWORD, GpSolidFill**);
+GpStatus WINAPI GdipDeleteBrush(void*);
+GpStatus WINAPI GdipFillEllipse(GpGraphics*, void*, REAL, REAL, REAL, REAL);
+GpStatus WINAPI GdipSetTextRenderingHint(GpGraphics*, int);
+GpStatus WINAPI GdipCreateFontFamilyFromName(const WCHAR*, void*, GpFontFamily**);
+GpStatus WINAPI GdipDeleteFontFamily(GpFontFamily*);
+GpStatus WINAPI GdipCreateFont(GpFontFamily*, REAL, int, int, GpFont**);
+GpStatus WINAPI GdipDeleteFont(GpFont*);
+GpStatus WINAPI GdipCreateStringFormat(int, LANGID, GpStringFormat**);
+GpStatus WINAPI GdipDeleteStringFormat(GpStringFormat*);
+GpStatus WINAPI GdipSetStringFormatAlign(GpStringFormat*, int);
+GpStatus WINAPI GdipSetStringFormatLineAlign(GpStringFormat*, int);
+GpStatus WINAPI GdipDrawString(GpGraphics*, const WCHAR*, int, GpFont*, const RectF*, GpStringFormat*, void*);
+GpStatus WINAPI GdipCreateBitmapFromScan0(INT, INT, INT, INT, BYTE*, GpBitmap**);
+GpStatus WINAPI GdipDisposeImage(void*);
+GpStatus WINAPI GdipGetImageGraphicsContext(void*, GpGraphics**);
+GpStatus WINAPI GdipGraphicsClear(GpGraphics*, DWORD);
+GpStatus WINAPI GdipSetCompositingMode(GpGraphics*, int);
+GpStatus WINAPI GdipSetCompositingQuality(GpGraphics*, int);
+GpStatus WINAPI GdipSetPixelOffsetMode(GpGraphics*, int);
+
+enum { CompositingQualityHighQuality = 2 };
+enum { PixelOffsetModeHighQuality = 2 };
+
 #define CHECKFOREGROUNDELAPSED_TIMEOUT 300
 #define POPUPMENU_SAFETOREMOVE_TIMEOUT 300
 #define POPUPMENU_BLUETOOTH_TIMEOUT 700
@@ -146,6 +193,7 @@ DWORD bWasPinnedItemsActAsQuickLaunch = FALSE;
 DWORD bPinnedItemsActAsQuickLaunch = FALSE;
 DWORD bWasRemoveExtraGapAroundPinnedItems = FALSE;
 DWORD bRemoveExtraGapAroundPinnedItems = FALSE;
+DWORD bShowCombinedWindowCount = FALSE;
 DWORD dwUndeadStartCorner = FALSE;
 DWORD dwOldTaskbarAl = 0b110;
 DWORD dwMMOldTaskbarAl = 0b110;
@@ -1014,7 +1062,8 @@ typedef struct ITaskBtnGroupVtbl
         ITaskBtnGroup* This);
 
     HRESULT(STDMETHODCALLTYPE* GetGroup)(
-        ITaskBtnGroup* This);
+        ITaskBtnGroup* This,
+        ITaskGroup** ppTaskGroup);
 
     HRESULT(STDMETHODCALLTYPE* AddTaskItem)(
         ITaskBtnGroup* This);
@@ -1080,6 +1129,727 @@ int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(ITaskBtnGroup* pTaskBtnGrou
         *pGroupType = lastGroupType;
     }
     return ret;
+}
+
+// Helper function to get window count from ITaskGroup
+int GetTaskGroupWindowCount(ITaskGroup* pTaskGroup)
+{
+    if (!pTaskGroup) return 0;
+    PBYTE _this = (PBYTE)pTaskGroup - 16 /*sizeof(CTaskUnknown)*/;
+    HDPA hdpaItems = *(HDPA*)(_this + 48 /*offsetof(CTaskGroup, m_hdpaItems)*/);
+    if (!hdpaItems) return 0;
+    return DPA_GetPtrCount(hdpaItems);
+}
+
+#define MSTASKLISTWCLASS_BADGE_TIMER_ID 12345
+#define MSTASKLISTWCLASS_BADGE_OVERLAY_CLASS L"EP_TaskbarBadgeOverlay"
+
+// Badge overlay window - stores badge info
+typedef struct {
+    RECT rcBadge;      // Screen coordinates
+    int count;
+} BadgeInfo;
+
+#define MAX_BADGES 64
+#define MAX_TASKBARS 16
+
+// Per-taskbar badge data
+typedef struct {
+    HWND hTaskListWnd;           // MSTaskListWClass window
+    HWND hOverlay;               // Overlay window for this taskbar
+    BadgeInfo badges[MAX_BADGES];
+    BadgeInfo prevBadges[MAX_BADGES];
+    int badgeCount;
+    int prevBadgeCount;
+} TaskbarBadgeData;
+
+static TaskbarBadgeData g_taskbarBadges[MAX_TASKBARS];
+static int g_taskbarCount = 0;
+static BOOL g_bBadgeClassRegistered = FALSE;
+static CRITICAL_SECTION g_badgeLock;
+static BOOL g_bBadgeLockInitialized = FALSE;
+
+// Get or create badge data for a taskbar window
+static TaskbarBadgeData* GetTaskbarBadgeData(HWND hTaskListWnd, BOOL bCreate)
+{
+    if (!g_bBadgeLockInitialized)
+    {
+        InitializeCriticalSection(&g_badgeLock);
+        g_bBadgeLockInitialized = TRUE;
+    }
+    
+    EnterCriticalSection(&g_badgeLock);
+    
+    // Find existing
+    for (int i = 0; i < g_taskbarCount; i++)
+    {
+        if (g_taskbarBadges[i].hTaskListWnd == hTaskListWnd)
+        {
+            LeaveCriticalSection(&g_badgeLock);
+            return &g_taskbarBadges[i];
+        }
+    }
+    
+    // Create new if requested
+    if (bCreate && g_taskbarCount < MAX_TASKBARS)
+    {
+        TaskbarBadgeData* pData = &g_taskbarBadges[g_taskbarCount];
+        memset(pData, 0, sizeof(TaskbarBadgeData));
+        pData->hTaskListWnd = hTaskListWnd;
+        g_taskbarCount++;
+        LeaveCriticalSection(&g_badgeLock);
+        return pData;
+    }
+    
+    LeaveCriticalSection(&g_badgeLock);
+    return NULL;
+}
+
+// Remove badge data for a taskbar window
+static void RemoveTaskbarBadgeData(HWND hTaskListWnd)
+{
+    if (!g_bBadgeLockInitialized) return;
+    
+    EnterCriticalSection(&g_badgeLock);
+    
+    for (int i = 0; i < g_taskbarCount; i++)
+    {
+        if (g_taskbarBadges[i].hTaskListWnd == hTaskListWnd)
+        {
+            // Destroy overlay if exists
+            if (g_taskbarBadges[i].hOverlay && IsWindow(g_taskbarBadges[i].hOverlay))
+            {
+                DestroyWindow(g_taskbarBadges[i].hOverlay);
+            }
+            // Shift remaining entries
+            for (int j = i; j < g_taskbarCount - 1; j++)
+            {
+                g_taskbarBadges[j] = g_taskbarBadges[j + 1];
+            }
+            g_taskbarCount--;
+            break;
+        }
+    }
+    
+    LeaveCriticalSection(&g_badgeLock);
+}
+
+// Parse window count from button accessibility name
+// Returns count if found, 0 otherwise
+static int ParseWindowCountFromName(BSTR bstrName)
+{
+    if (!bstrName) return 0;
+    
+    int count = 0;
+    WCHAR* pPattern = NULL;
+    
+    // Try various patterns for window count in different locales
+    // English: "X running windows", "X windows", "X running window"
+    // Also handle patterns like "(X)" at the end
+    
+    static const WCHAR* patterns[] = {
+        L" running windows",
+        L" running window",
+        L" windows",
+        L" window",
+        L" laufende Fenster",  // German
+        L" Fenster",           // German
+        L" ventanas",          // Spanish
+        L" ventana",           // Spanish
+        L" fenêtres",          // French
+        L" fenêtre",           // French
+        NULL
+    };
+    
+    for (int i = 0; patterns[i] != NULL; i++)
+    {
+        pPattern = wcsstr(bstrName, patterns[i]);
+        if (pPattern && pPattern > bstrName)
+        {
+            // Look backwards for the number
+            WCHAR* pNumEnd = pPattern;
+            WCHAR* pNumStart = pPattern - 1;
+            while (pNumStart >= bstrName && *pNumStart >= L'0' && *pNumStart <= L'9')
+            {
+                pNumStart--;
+            }
+            pNumStart++;
+            
+            if (pNumStart < pNumEnd && pNumEnd - pNumStart < 10)
+            {
+                WCHAR numBuf[16] = { 0 };
+                wcsncpy_s(numBuf, 16, pNumStart, pNumEnd - pNumStart);
+                count = _wtoi(numBuf);
+                if (count > 0) return count;
+            }
+        }
+    }
+    
+    // Try pattern: ends with "(X)" where X is a number
+    size_t len = wcslen(bstrName);
+    if (len > 3 && bstrName[len - 1] == L')')
+    {
+        WCHAR* pOpen = wcsrchr(bstrName, L'(');
+        if (pOpen && pOpen > bstrName)
+        {
+            WCHAR numBuf[16] = { 0 };
+            wcsncpy_s(numBuf, 16, pOpen + 1, len - 2 - (pOpen - bstrName));
+            // Check if it's a number
+            int n = _wtoi(numBuf);
+            if (n > 0)
+            {
+                BOOL allDigits = TRUE;
+                for (int i = 0; numBuf[i] && numBuf[i] != L')'; i++)
+                {
+                    if (numBuf[i] < L'0' || numBuf[i] > L'9')
+                    {
+                        allDigits = FALSE;
+                        break;
+                    }
+                }
+                if (allDigits) count = n;
+            }
+        }
+    }
+    
+    return count;
+}
+
+// Badge overlay window procedure - minimal, UpdateLayeredWindow handles drawing
+LRESULT CALLBACK BadgeOverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    switch (uMsg)
+    {
+    case WM_WINDOWPOSCHANGING:
+    {
+        // Always stay on top - prevent being pushed down by other windows
+        WINDOWPOS* pWP = (WINDOWPOS*)lParam;
+        pWP->hwndInsertAfter = HWND_TOPMOST;
+        return 0;
+    }
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;  // Click through
+    }
+    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+// Check if badge data has changed
+static BOOL BadgeDataChanged(TaskbarBadgeData* pData)
+{
+    if (pData->badgeCount != pData->prevBadgeCount) return TRUE;
+    for (int i = 0; i < pData->badgeCount; i++)
+    {
+        if (pData->badges[i].count != pData->prevBadges[i].count ||
+            memcmp(&pData->badges[i].rcBadge, &pData->prevBadges[i].rcBadge, sizeof(RECT)) != 0)
+        {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// Save current badge state for change detection
+static void SaveBadgeState(TaskbarBadgeData* pData)
+{
+    pData->prevBadgeCount = pData->badgeCount;
+    memcpy(pData->prevBadges, pData->badges, sizeof(BadgeInfo) * pData->badgeCount);
+}
+
+// Render badges to overlay using UpdateLayeredWindow (flicker-free)
+static void RenderBadgeOverlay(TaskbarBadgeData* pData, RECT* prcBounds)
+{
+    if (!pData || !pData->hOverlay) return;
+    
+    int width = prcBounds->right - prcBounds->left;
+    int height = prcBounds->bottom - prcBounds->top;
+    if (width <= 0 || height <= 0) return;
+    
+    // Get DPI
+    UINT dpi = 96;
+    HMONITOR hMon = MonitorFromWindow(pData->hOverlay, MONITOR_DEFAULTTONEAREST);
+    if (hMon)
+    {
+        UINT dpiX, dpiY;
+        if (SUCCEEDED(GetDpiForMonitor(hMon, MDT_DEFAULT, &dpiX, &dpiY)))
+        {
+            dpi = dpiX;
+        }
+    }
+    double scale = (double)dpi / 96.0;
+    
+    // Create 32-bit ARGB bitmap
+    BITMAPINFO bmi = { 0 };
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;  // Top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    
+    void* pvBits = NULL;
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    HBITMAP hBitmap = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pvBits, NULL, 0);
+    
+    if (!hBitmap || !pvBits)
+    {
+        DeleteDC(hdcMem);
+        ReleaseDC(NULL, hdcScreen);
+        return;
+    }
+    
+    HBITMAP hOldBitmap = (HBITMAP)SelectObject(hdcMem, hBitmap);
+    
+    // Clear to fully transparent
+    memset(pvBits, 0, width * height * 4);
+    
+    // Draw each badge using GDI+ for smooth anti-aliased rendering
+    for (int i = 0; i < pData->badgeCount; i++)
+    {
+        // Convert screen coordinates to bitmap coordinates
+        RECT rcBadge = pData->badges[i].rcBadge;
+        OffsetRect(&rcBadge, -prcBounds->left, -prcBounds->top);
+        
+        WCHAR wszCount[8];
+        swprintf_s(wszCount, 8, L"%d", pData->badges[i].count);
+        
+        // Get Windows accent color
+        DWORD accentColor = 0;
+        BOOL opaque = FALSE;
+        if (FAILED(DwmGetColorizationColor(&accentColor, &opaque)))
+        {
+            accentColor = 0x00D77800;  // Default blue if API fails
+        }
+        BYTE accentR = (accentColor >> 16) & 0xFF;
+        BYTE accentG = (accentColor >> 8) & 0xFF;
+        BYTE accentB = accentColor & 0xFF;
+        
+        BYTE bgAlpha = 127;  // 50% transparency
+        
+        // Create GDI+ bitmap from the DIB section scan0 for direct ARGB drawing
+        GpBitmap* pBitmap = NULL;
+        GpStatus status = GdipCreateBitmapFromScan0(width, height, width * 4, 
+            PixelFormat32bppPARGB, (BYTE*)pvBits, &pBitmap);
+        
+        if (status == Ok && pBitmap)
+        {
+            GpGraphics* pGraphics = NULL;
+            if (GdipGetImageGraphicsContext(pBitmap, &pGraphics) == Ok && pGraphics)
+            {
+                // Set high quality rendering
+                GdipSetSmoothingMode(pGraphics, SmoothingModeHighQuality);
+                GdipSetCompositingMode(pGraphics, CompositingModeSourceOver);
+                GdipSetCompositingQuality(pGraphics, CompositingQualityHighQuality);
+                GdipSetPixelOffsetMode(pGraphics, PixelOffsetModeHighQuality);
+                
+                // Create brush with accent color AND the desired alpha (premultiplied)
+                // For premultiplied alpha: R,G,B channels must be multiplied by alpha
+                BYTE pmR = (accentR * bgAlpha) / 255;
+                BYTE pmG = (accentG * bgAlpha) / 255;
+                BYTE pmB = (accentB * bgAlpha) / 255;
+                DWORD brushColor = (bgAlpha << 24) | (pmR << 16) | (pmG << 8) | pmB;
+                
+                GpSolidFill* pBrush = NULL;
+                // Note: GDI+ expects non-premultiplied ARGB, it does the premultiplication
+                DWORD gdipColor = (bgAlpha << 24) | (accentR << 16) | (accentG << 8) | accentB;
+                GdipCreateSolidFill(gdipColor, &pBrush);
+                
+                if (pBrush)
+                {
+                    // Draw filled ellipse with smooth anti-aliasing
+                    GdipFillEllipse(pGraphics, pBrush, 
+                        (REAL)rcBadge.left, (REAL)rcBadge.top, 
+                        (REAL)(rcBadge.right - rcBadge.left), (REAL)(rcBadge.bottom - rcBadge.top));
+                    GdipDeleteBrush(pBrush);
+                }
+                
+                // Draw text with full opacity white
+                GdipSetTextRenderingHint(pGraphics, TextRenderingHintAntiAliasGridFit);
+                
+                GpSolidFill* pTextBrush = NULL;
+                GdipCreateSolidFill(0xFFFFFFFF, &pTextBrush);  // Full white
+                
+                GpFontFamily* pFontFamily = NULL;
+                GdipCreateFontFamilyFromName(L"Segoe UI", NULL, &pFontFamily);
+                
+                if (pFontFamily && pTextBrush)
+                {
+                    GpFont* pFont = NULL;
+                    GdipCreateFont(pFontFamily, (REAL)(11 * scale), FontStyleBold, UnitPixel, &pFont);
+                    
+                    if (pFont)
+                    {
+                        GpStringFormat* pFormat = NULL;
+                        GdipCreateStringFormat(0, LANG_NEUTRAL, &pFormat);
+                        if (pFormat)
+                        {
+                            GdipSetStringFormatAlign(pFormat, StringAlignmentCenter);
+                            GdipSetStringFormatLineAlign(pFormat, StringAlignmentCenter);
+                            
+                            RectF layoutRect = { (REAL)rcBadge.left, (REAL)rcBadge.top, 
+                                (REAL)(rcBadge.right - rcBadge.left), (REAL)(rcBadge.bottom - rcBadge.top) };
+                            
+                            GdipDrawString(pGraphics, wszCount, -1, pFont, &layoutRect, pFormat, pTextBrush);
+                            GdipDeleteStringFormat(pFormat);
+                        }
+                        GdipDeleteFont(pFont);
+                    }
+                    GdipDeleteFontFamily(pFontFamily);
+                }
+                if (pTextBrush) GdipDeleteBrush(pTextBrush);
+                
+                GdipDeleteGraphics(pGraphics);
+            }
+            GdipDisposeImage(pBitmap);
+        }
+        else
+        {
+            // Fallback to GDI if GDI+ bitmap creation fails
+            DWORD* pPixels = (DWORD*)pvBits;
+            HBRUSH hBrushBg = CreateSolidBrush(RGB(accentR, accentG, accentB));
+            HPEN hPenNull = CreatePen(PS_NULL, 0, 0);
+            HBRUSH hOldBrush = (HBRUSH)SelectObject(hdcMem, hBrushBg);
+            HPEN hOldPen = (HPEN)SelectObject(hdcMem, hPenNull);
+            Ellipse(hdcMem, rcBadge.left, rcBadge.top, rcBadge.right, rcBadge.bottom);
+            SelectObject(hdcMem, hOldBrush);
+            SelectObject(hdcMem, hOldPen);
+            DeleteObject(hBrushBg);
+            DeleteObject(hPenNull);
+            
+            // Manually set alpha
+            for (int y = max(0, rcBadge.top); y < min(height, rcBadge.bottom); y++)
+            {
+                for (int x = max(0, rcBadge.left); x < min(width, rcBadge.right); x++)
+                {
+                    DWORD* pPixel = &pPixels[y * width + x];
+                    BYTE b = (*pPixel) & 0xFF;
+                    BYTE g = (*pPixel >> 8) & 0xFF;
+                    BYTE r = (*pPixel >> 16) & 0xFF;
+                    if (r > 0 || g > 0 || b > 0)
+                    {
+                        r = (r * bgAlpha) / 255;
+                        g = (g * bgAlpha) / 255;
+                        b = (b * bgAlpha) / 255;
+                        *pPixel = (bgAlpha << 24) | (r << 16) | (g << 8) | b;
+                    }
+                }
+            }
+            
+            // GDI text fallback
+            SetBkMode(hdcMem, TRANSPARENT);
+            SetTextColor(hdcMem, RGB(255, 255, 255));
+            HFONT hFont = CreateFontW((int)(-11 * scale), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 
+                DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+            HFONT hOldFont = (HFONT)SelectObject(hdcMem, hFont);
+            DrawTextW(hdcMem, wszCount, -1, &rcBadge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(hdcMem, hOldFont);
+            DeleteObject(hFont);
+            
+            // Set text pixels to full alpha
+            for (int y = max(0, rcBadge.top); y < min(height, rcBadge.bottom); y++)
+            {
+                for (int x = max(0, rcBadge.left); x < min(width, rcBadge.right); x++)
+                {
+                    DWORD* pPixel = &pPixels[y * width + x];
+                    BYTE b = (*pPixel) & 0xFF;
+                    BYTE g = (*pPixel >> 8) & 0xFF;
+                    BYTE r = (*pPixel >> 16) & 0xFF;
+                    if (r > 200 && g > 200 && b > 200)
+                    {
+                        *pPixel = (255 << 24) | (255 << 16) | (255 << 8) | 255;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Update layered window
+    POINT ptSrc = { 0, 0 };
+    POINT ptDst = { prcBounds->left, prcBounds->top };
+    SIZE szWnd = { width, height };
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    
+    UpdateLayeredWindow(pData->hOverlay, hdcScreen, &ptDst, &szWnd, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
+    
+    // Ensure overlay stays on top (above thumbnail previews)
+    SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    
+    SelectObject(hdcMem, hOldBitmap);
+    DeleteObject(hBitmap);
+    DeleteDC(hdcMem);
+    ReleaseDC(NULL, hdcScreen);
+}
+
+// Update badge overlay with current button positions
+void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
+{
+    // Get or create per-taskbar data
+    TaskbarBadgeData* pData = GetTaskbarBadgeData(hTaskListWnd, TRUE);
+    if (!pData) return;
+    
+    if (!bShowCombinedWindowCount) 
+    {
+        if (pData->hOverlay && IsWindow(pData->hOverlay))
+        {
+            ShowWindow(pData->hOverlay, SW_HIDE);
+        }
+        return;
+    }
+    if (bOldTaskbar == 0 || bOldTaskbar == (DWORD)-1) return;
+    
+    // Register overlay class if needed
+    if (!g_bBadgeClassRegistered)
+    {
+        WNDCLASSW wc = { 0 };
+        wc.lpfnWndProc = BadgeOverlayWndProc;
+        wc.hInstance = hModule;
+        wc.lpszClassName = MSTASKLISTWCLASS_BADGE_OVERLAY_CLASS;
+        wc.hbrBackground = NULL;  // Transparent
+        if (RegisterClassW(&wc))
+        {
+            g_bBadgeClassRegistered = TRUE;
+        }
+    }
+    
+    // Initialize COM for UI Automation
+    HRESULT hrCom = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    BOOL bComInitialized = SUCCEEDED(hrCom) || hrCom == S_FALSE || hrCom == RPC_E_CHANGED_MODE;
+    if (!bComInitialized) return;
+    
+    IUIAutomation* pAutomation = NULL;
+    HRESULT hr = CoCreateInstance(&CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, &IID_IUIAutomation, (void**)&pAutomation);
+    if (FAILED(hr) || !pAutomation)
+    {
+        if (hrCom == S_OK) CoUninitialize();
+        return;
+    }
+    
+    IUIAutomationElement* pTaskListElement = NULL;
+    hr = pAutomation->lpVtbl->ElementFromHandle(pAutomation, hTaskListWnd, &pTaskListElement);
+    if (FAILED(hr) || !pTaskListElement)
+    {
+        pAutomation->lpVtbl->Release(pAutomation);
+        if (hrCom == S_OK) CoUninitialize();
+        return;
+    }
+    
+    IUIAutomationTreeWalker* pWalker = NULL;
+    hr = pAutomation->lpVtbl->get_ControlViewWalker(pAutomation, &pWalker);
+    if (FAILED(hr) || !pWalker)
+    {
+        pTaskListElement->lpVtbl->Release(pTaskListElement);
+        pAutomation->lpVtbl->Release(pAutomation);
+        if (hrCom == S_OK) CoUninitialize();
+        return;
+    }
+    
+    // Collect badge info
+    pData->badgeCount = 0;
+    RECT rcBounds = { MAXLONG, MAXLONG, MINLONG, MINLONG };
+    
+    // Get DPI for calculations
+    UINT dpi = 96;
+    HMONITOR hMon = MonitorFromWindow(hTaskListWnd, MONITOR_DEFAULTTONEAREST);
+    if (hMon)
+    {
+        UINT dpiX, dpiY;
+        if (SUCCEEDED(GetDpiForMonitor(hMon, MDT_DEFAULT, &dpiX, &dpiY)))
+        {
+            dpi = dpiX;
+        }
+    }
+    double scale = (double)dpi / 96.0;
+    
+    // Temporary DC for text measurement
+    HDC hdcTemp = GetDC(NULL);
+    HFONT hFont = CreateFontW(
+        (int)(-11 * scale), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI"
+    );
+    HFONT hOldFont = (HFONT)SelectObject(hdcTemp, hFont);
+    
+    IUIAutomationElement* pChild = NULL;
+    hr = pWalker->lpVtbl->GetFirstChildElement(pWalker, pTaskListElement, &pChild);
+    
+    while (SUCCEEDED(hr) && pChild && pData->badgeCount < MAX_BADGES)
+    {
+        BSTR bstrName = NULL;
+        pChild->lpVtbl->get_CurrentName(pChild, &bstrName);
+        
+        int count = ParseWindowCountFromName(bstrName);
+        
+        if (count > 1)
+        {
+            RECT rcButton = { 0 };
+            pChild->lpVtbl->get_CurrentBoundingRectangle(pChild, &rcButton);
+            
+            if (rcButton.right > rcButton.left && rcButton.bottom > rcButton.top)
+            {
+                WCHAR wszCount[8];
+                swprintf_s(wszCount, 8, L"%d", count);
+                
+                SIZE textSize;
+                GetTextExtentPoint32W(hdcTemp, wszCount, (int)wcslen(wszCount), &textSize);
+                
+                int badgePadding = (int)(3 * scale);
+                int badgeTextWidth = textSize.cx + badgePadding * 2;
+                // Circular badge - use max dimension for diameter
+                int badgeDiameter = max(badgeTextWidth, textSize.cy + badgePadding * 2);
+                badgeDiameter = max(badgeDiameter, (int)(16 * scale));  // Minimum size
+                
+                // Position badge at top-center of the button
+                int buttonWidth = rcButton.right - rcButton.left;
+                int badgeX = rcButton.left + (buttonWidth - badgeDiameter) / 2;
+                int badgeY = rcButton.top + (int)(2 * scale);
+                int badgeWidth = badgeDiameter;
+                int badgeHeight = badgeDiameter;
+                
+                pData->badges[pData->badgeCount].rcBadge.left = badgeX;
+                pData->badges[pData->badgeCount].rcBadge.top = badgeY;
+                pData->badges[pData->badgeCount].rcBadge.right = badgeX + badgeWidth;
+                pData->badges[pData->badgeCount].rcBadge.bottom = badgeY + badgeHeight;
+                pData->badges[pData->badgeCount].count = count;
+                pData->badgeCount++;
+                
+                // Expand bounds
+                if (badgeX < rcBounds.left) rcBounds.left = badgeX;
+                if (badgeY < rcBounds.top) rcBounds.top = badgeY;
+                if (badgeX + badgeWidth > rcBounds.right) rcBounds.right = badgeX + badgeWidth;
+                if (badgeY + badgeHeight > rcBounds.bottom) rcBounds.bottom = badgeY + badgeHeight;
+            }
+        }
+        
+        if (bstrName) SysFreeString(bstrName);
+        
+        IUIAutomationElement* pNext = NULL;
+        pWalker->lpVtbl->GetNextSiblingElement(pWalker, pChild, &pNext);
+        pChild->lpVtbl->Release(pChild);
+        pChild = pNext;
+    }
+    
+    SelectObject(hdcTemp, hOldFont);
+    DeleteObject(hFont);
+    ReleaseDC(NULL, hdcTemp);
+    
+    pWalker->lpVtbl->Release(pWalker);
+    pTaskListElement->lpVtbl->Release(pTaskListElement);
+    pAutomation->lpVtbl->Release(pAutomation);
+    
+    if (hrCom == S_OK) CoUninitialize();
+    
+    // Check if badge data has changed
+    BOOL bDataChanged = BadgeDataChanged(pData);
+    
+    // Always ensure z-order even if data hasn't changed (thumbnail previews can cover us)
+    if (pData->hOverlay && IsWindow(pData->hOverlay) && pData->badgeCount > 0)
+    {
+        SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    
+    // Skip re-rendering if unchanged
+    if (!bDataChanged && pData->hOverlay && IsWindow(pData->hOverlay))
+    {
+        return;
+    }
+    
+    // Save current state for next comparison
+    SaveBadgeState(pData);
+    
+    // Update or create overlay window
+    if (pData->badgeCount > 0)
+    {
+        HWND hTaskbar = GetAncestor(hTaskListWnd, GA_ROOT);
+        BOOL bNewlyCreated = FALSE;
+        
+        if (!pData->hOverlay || !IsWindow(pData->hOverlay))
+        {
+            pData->hOverlay = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                MSTASKLISTWCLASS_BADGE_OVERLAY_CLASS,
+                NULL,
+                WS_POPUP,
+                0, 0, 1, 1,  // Initial size, will be set by UpdateLayeredWindow
+                hTaskbar,
+                NULL,
+                hModule,
+                NULL
+            );
+            bNewlyCreated = TRUE;
+        }
+        
+        if (pData->hOverlay)
+        {
+            // Render badges using UpdateLayeredWindow (flicker-free)
+            RenderBadgeOverlay(pData, &rcBounds);
+            
+            // Show only if newly created or was hidden
+            if (bNewlyCreated || !IsWindowVisible(pData->hOverlay))
+            {
+                ShowWindow(pData->hOverlay, SW_SHOWNOACTIVATE);
+            }
+        }
+    }
+    else
+    {
+        // No badges to show
+        if (pData->hOverlay && IsWindow(pData->hOverlay))
+        {
+            ShowWindow(pData->hOverlay, SW_HIDE);
+        }
+    }
+}
+
+// MSTaskListWClass subclass procedure for drawing window count badges
+LRESULT CALLBACK MSTaskListWClass_SubclassProc(
+    _In_ HWND hWnd,
+    _In_ UINT uMsg,
+    _In_ WPARAM wParam,
+    _In_ LPARAM lParam,
+    UINT_PTR uIdSubclass,
+    DWORD_PTR dwRefData
+)
+{
+    if (uMsg == WM_NCDESTROY)
+    {
+        KillTimer(hWnd, MSTASKLISTWCLASS_BADGE_TIMER_ID);
+        // Remove per-taskbar badge data (also destroys overlay)
+        RemoveTaskbarBadgeData(hWnd);
+        RemoveWindowSubclass(hWnd, MSTaskListWClass_SubclassProc, MSTaskListWClass_SubclassProc);
+    }
+    else if (uMsg == WM_TIMER && wParam == MSTASKLISTWCLASS_BADGE_TIMER_ID)
+    {
+        // Kill timer - we use one-shot timers to avoid buildup
+        KillTimer(hWnd, MSTASKLISTWCLASS_BADGE_TIMER_ID);
+        
+        BOOL bShouldDraw = bShowCombinedWindowCount && (bOldTaskbar >= 1 && bOldTaskbar != (DWORD)-1);
+        if (bShouldDraw)
+        {
+            MSTaskListWClass_UpdateBadgeOverlay(hWnd);
+        }
+        else
+        {
+            TaskbarBadgeData* pData = GetTaskbarBadgeData(hWnd, FALSE);
+            if (pData && pData->hOverlay && IsWindow(pData->hOverlay))
+            {
+                ShowWindow(pData->hOverlay, SW_HIDE);
+            }
+        }
+        return 0;
+    }
+    else if (uMsg == WM_PAINT || uMsg == WM_SIZE || uMsg == WM_WINDOWPOSCHANGED)
+    {
+        LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+        // Schedule update after a delay to batch updates (use 200ms to reduce frequency)
+        BOOL bShouldDraw = bShowCombinedWindowCount && (bOldTaskbar >= 1 && bOldTaskbar != (DWORD)-1);
+        if (bShouldDraw)
+        {
+            SetTimer(hWnd, MSTASKLISTWCLASS_BADGE_TIMER_ID, 200, NULL);
+        }
+        return result;
+    }
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
 void Win10TaskbarHooks_ConditionalPatchITaskGroupVtbl(ITaskGroupVtbl* pVtbl)
@@ -6311,6 +7081,21 @@ void WINAPI LoadSettings(LPARAM lParam)
                 dwRefreshUIMask |= REFRESHUI_TASKBAR;
             }
         }
+        dwTemp = FALSE;
+        dwSize = sizeof(DWORD);
+        RegQueryValueExW(
+            hKey,
+            TEXT("ShowCombinedWindowCount"),
+            0,
+            NULL,
+            &dwTemp,
+            &dwSize
+        );
+        if (dwTemp != bShowCombinedWindowCount)
+        {
+            bShowCombinedWindowCount = dwTemp;
+            dwRefreshUIMask |= REFRESHUI_TASKBAR;
+        }
         dwSize = sizeof(DWORD);
         RegQueryValueExW(
             hKey,
@@ -7158,6 +7943,11 @@ HWND CreateWindowExWHook(
     else if (bIsExplorerProcess && (*((WORD*)&(lpClassName)+1)) && !_wcsicmp(lpClassName, L"ReBarWindow32") && hWndParent == FindWindowW(L"Shell_TrayWnd", NULL))
     {
         SetWindowSubclass(hWnd, ReBarWindow32SubclassProc, ReBarWindow32SubclassProc, FALSE);
+    }
+    else if (bIsExplorerProcess && (*((WORD*)&(lpClassName)+1)) && !wcscmp(lpClassName, L"MSTaskListWClass"))
+    {
+        // Always install subclass - it will check bShowCombinedWindowCount and bOldTaskbar at runtime
+        SetWindowSubclass(hWnd, MSTaskListWClass_SubclassProc, MSTaskListWClass_SubclassProc, 0);
     }
 #endif
     /*

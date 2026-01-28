@@ -91,6 +91,9 @@
 ;x 1 %R:1040%
 ;x 2 %R:1042%
 "MMTaskbarGlomLevel"=dword:00000000
+[HKEY_CURRENT_USER\Software\ExplorerPatcher]
+;b %R:1049%
+"ShowCombinedWindowCount"=dword:00000000
 ;s Taskbar_Windows10Section IsOldTaskbar
 [HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced]
 ;c 2 %R:1044%
