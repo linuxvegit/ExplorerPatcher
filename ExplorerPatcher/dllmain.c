@@ -1329,41 +1329,14 @@ LRESULT CALLBACK BadgeOverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
         {
             BOOL bShouldHide = FALSE;
             
-            // Check for full-screen mode
+            // Only hide for D3D full-screen mode (exclusive full-screen games)
+            // For windowed full-screen (F11), the badge will be visible but the taskbar auto-hides anyway
             QUERY_USER_NOTIFICATION_STATE quns = QUNS_ACCEPTS_NOTIFICATIONS;
             if (SUCCEEDED(SHQueryUserNotificationState(&quns)))
             {
-                if (quns == QUNS_RUNNING_D3D_FULL_SCREEN || quns == QUNS_BUSY)
+                if (quns == QUNS_RUNNING_D3D_FULL_SCREEN)
                 {
                     bShouldHide = TRUE;
-                }
-            }
-            
-            // Also check if parent taskbar is off-screen (auto-hide or full-screen)
-            if (!bShouldHide)
-            {
-                HWND hTaskbar = GetParent(hWnd);
-                if (hTaskbar)
-                {
-                    RECT rcTaskbar;
-                    if (GetWindowRect(hTaskbar, &rcTaskbar))
-                    {
-                        HMONITOR hMon = MonitorFromWindow(hTaskbar, MONITOR_DEFAULTTONEAREST);
-                        if (hMon)
-                        {
-                            MONITORINFO mi = { sizeof(mi) };
-                            if (GetMonitorInfoW(hMon, &mi))
-                            {
-                                if (rcTaskbar.right <= mi.rcMonitor.left || 
-                                    rcTaskbar.left >= mi.rcMonitor.right ||
-                                    rcTaskbar.bottom <= mi.rcMonitor.top || 
-                                    rcTaskbar.top >= mi.rcMonitor.bottom)
-                                {
-                                    bShouldHide = TRUE;
-                                }
-                            }
-                        }
-                    }
                 }
             }
             
@@ -1650,6 +1623,164 @@ static void RenderBadgeOverlay(TaskbarBadgeData* pData, RECT* prcBounds)
     ReleaseDC(NULL, hdcScreen);
 }
 
+// Draw badges directly on taskbar window (no overlay)
+void MSTaskListWClass_DrawBadgesDirect(HWND hTaskListWnd)
+{
+    if (!bShowCombinedWindowCount) return;
+    if (bOldTaskbar == 0 || bOldTaskbar == (DWORD)-1) return;
+    
+    // Initialize COM for UI Automation
+    HRESULT hrCom = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    BOOL bComInitialized = SUCCEEDED(hrCom) || hrCom == S_FALSE || hrCom == RPC_E_CHANGED_MODE;
+    if (!bComInitialized) return;
+    
+    IUIAutomation* pAutomation = NULL;
+    HRESULT hr = CoCreateInstance(&CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, &IID_IUIAutomation, (void**)&pAutomation);
+    if (FAILED(hr) || !pAutomation)
+    {
+        if (hrCom == S_OK) CoUninitialize();
+        return;
+    }
+    
+    IUIAutomationElement* pTaskListElement = NULL;
+    hr = pAutomation->lpVtbl->ElementFromHandle(pAutomation, hTaskListWnd, &pTaskListElement);
+    if (FAILED(hr) || !pTaskListElement)
+    {
+        pAutomation->lpVtbl->Release(pAutomation);
+        if (hrCom == S_OK) CoUninitialize();
+        return;
+    }
+    
+    IUIAutomationTreeWalker* pWalker = NULL;
+    hr = pAutomation->lpVtbl->get_ControlViewWalker(pAutomation, &pWalker);
+    if (FAILED(hr) || !pWalker)
+    {
+        pTaskListElement->lpVtbl->Release(pTaskListElement);
+        pAutomation->lpVtbl->Release(pAutomation);
+        if (hrCom == S_OK) CoUninitialize();
+        return;
+    }
+    
+    // Get DPI for calculations
+    UINT dpi = 96;
+    HMONITOR hMon = MonitorFromWindow(hTaskListWnd, MONITOR_DEFAULTTONEAREST);
+    if (hMon)
+    {
+        UINT dpiX, dpiY;
+        if (SUCCEEDED(GetDpiForMonitor(hMon, MDT_DEFAULT, &dpiX, &dpiY)))
+        {
+            dpi = dpiX;
+        }
+    }
+    double scale = (double)dpi / 96.0;
+    
+    // Get DC for direct drawing
+    HDC hdc = GetDC(hTaskListWnd);
+    if (!hdc)
+    {
+        pWalker->lpVtbl->Release(pWalker);
+        pTaskListElement->lpVtbl->Release(pTaskListElement);
+        pAutomation->lpVtbl->Release(pAutomation);
+        if (hrCom == S_OK) CoUninitialize();
+        return;
+    }
+    
+    // Get client rect origin for coordinate conversion
+    POINT ptOrigin = { 0, 0 };
+    ClientToScreen(hTaskListWnd, &ptOrigin);
+    
+    // Get Windows accent color
+    DWORD accentColor = 0;
+    BOOL opaque = FALSE;
+    if (FAILED(DwmGetColorizationColor(&accentColor, &opaque)))
+    {
+        accentColor = 0x00D77800;
+    }
+    BYTE accentR = (accentColor >> 16) & 0xFF;
+    BYTE accentG = (accentColor >> 8) & 0xFF;
+    BYTE accentB = accentColor & 0xFF;
+    
+    // Create GDI objects for drawing
+    HBRUSH hBrushBg = CreateSolidBrush(RGB(accentR, accentG, accentB));
+    HPEN hPenNull = CreatePen(PS_NULL, 0, 0);
+    HFONT hFont = CreateFontW(
+        (int)(-11 * scale), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI"
+    );
+    
+    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, hBrushBg);
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPenNull);
+    HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(255, 255, 255));
+    
+    IUIAutomationElement* pChild = NULL;
+    hr = pWalker->lpVtbl->GetFirstChildElement(pWalker, pTaskListElement, &pChild);
+    
+    while (SUCCEEDED(hr) && pChild)
+    {
+        BSTR bstrName = NULL;
+        pChild->lpVtbl->get_CurrentName(pChild, &bstrName);
+        
+        int count = ParseWindowCountFromName(bstrName);
+        
+        if (count > 1)
+        {
+            RECT rcButton = { 0 };
+            pChild->lpVtbl->get_CurrentBoundingRectangle(pChild, &rcButton);
+            
+            if (rcButton.right > rcButton.left && rcButton.bottom > rcButton.top)
+            {
+                WCHAR wszCount[8];
+                swprintf_s(wszCount, 8, L"%d", count);
+                
+                SIZE textSize;
+                GetTextExtentPoint32W(hdc, wszCount, (int)wcslen(wszCount), &textSize);
+                
+                int badgePadding = (int)(3 * scale);
+                int badgeTextWidth = textSize.cx + badgePadding * 2;
+                int badgeDiameter = max(badgeTextWidth, textSize.cy + badgePadding * 2);
+                badgeDiameter = max(badgeDiameter, (int)(16 * scale));
+                
+                // Convert screen coordinates to client coordinates
+                int buttonWidth = rcButton.right - rcButton.left;
+                int badgeX = (rcButton.left - ptOrigin.x) + (buttonWidth - badgeDiameter) / 2;
+                int badgeY = (rcButton.top - ptOrigin.y) + (int)(2 * scale);
+                
+                RECT rcBadge = { badgeX, badgeY, badgeX + badgeDiameter, badgeY + badgeDiameter };
+                
+                // Draw filled ellipse (badge background)
+                Ellipse(hdc, rcBadge.left, rcBadge.top, rcBadge.right, rcBadge.bottom);
+                
+                // Draw badge text
+                DrawTextW(hdc, wszCount, -1, &rcBadge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+        }
+        
+        if (bstrName) SysFreeString(bstrName);
+        
+        IUIAutomationElement* pNext = NULL;
+        pWalker->lpVtbl->GetNextSiblingElement(pWalker, pChild, &pNext);
+        pChild->lpVtbl->Release(pChild);
+        pChild = pNext;
+    }
+    
+    SelectObject(hdc, hOldBrush);
+    SelectObject(hdc, hOldPen);
+    SelectObject(hdc, hOldFont);
+    DeleteObject(hBrushBg);
+    DeleteObject(hPenNull);
+    DeleteObject(hFont);
+    ReleaseDC(hTaskListWnd, hdc);
+    
+    pWalker->lpVtbl->Release(pWalker);
+    pTaskListElement->lpVtbl->Release(pTaskListElement);
+    pAutomation->lpVtbl->Release(pAutomation);
+    
+    if (hrCom == S_OK) CoUninitialize();
+}
+
 // Update badge overlay with current button positions
 void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
 {
@@ -1667,49 +1798,17 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
     }
     if (bOldTaskbar == 0 || bOldTaskbar == (DWORD)-1) return;
     
-    // Check if taskbar is visible (hide badge in full-screen mode)
-    // Use SHQueryUserNotificationState to detect full-screen apps
+    // Check if in D3D full-screen mode (hide badge for exclusive full-screen games)
     QUERY_USER_NOTIFICATION_STATE quns = QUNS_ACCEPTS_NOTIFICATIONS;
     if (SUCCEEDED(SHQueryUserNotificationState(&quns)))
     {
-        if (quns == QUNS_RUNNING_D3D_FULL_SCREEN || quns == QUNS_BUSY)
+        if (quns == QUNS_RUNNING_D3D_FULL_SCREEN)
         {
-            // A full-screen app is running, hide the badge
             if (pData->hOverlay && IsWindow(pData->hOverlay))
             {
                 ShowWindow(pData->hOverlay, SW_HIDE);
             }
             return;
-        }
-    }
-    
-    // Also check if taskbar window is actually on screen
-    HWND hTaskbar = GetAncestor(hTaskListWnd, GA_ROOT);
-    if (hTaskbar)
-    {
-        RECT rcTaskbar;
-        if (GetWindowRect(hTaskbar, &rcTaskbar))
-        {
-            HMONITOR hMon = MonitorFromWindow(hTaskbar, MONITOR_DEFAULTTONEAREST);
-            if (hMon)
-            {
-                MONITORINFO mi = { sizeof(mi) };
-                if (GetMonitorInfoW(hMon, &mi))
-                {
-                    // Check if taskbar is completely outside the monitor bounds (hidden)
-                    if (rcTaskbar.right <= mi.rcMonitor.left || 
-                        rcTaskbar.left >= mi.rcMonitor.right ||
-                        rcTaskbar.bottom <= mi.rcMonitor.top || 
-                        rcTaskbar.top >= mi.rcMonitor.bottom)
-                    {
-                        if (pData->hOverlay && IsWindow(pData->hOverlay))
-                        {
-                            ShowWindow(pData->hOverlay, SW_HIDE);
-                        }
-                        return;
-                    }
-                }
-            }
         }
     }
     
@@ -1875,6 +1974,7 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
     // Update or create overlay window
     if (pData->badgeCount > 0)
     {
+        HWND hTaskbarRoot = GetAncestor(hTaskListWnd, GA_ROOT);
         BOOL bNewlyCreated = FALSE;
         
         if (!pData->hOverlay || !IsWindow(pData->hOverlay))
@@ -1885,7 +1985,7 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
                 NULL,
                 WS_POPUP,
                 0, 0, 1, 1,  // Initial size, will be set by UpdateLayeredWindow
-                hTaskbar,
+                hTaskbarRoot,
                 NULL,
                 hModule,
                 NULL
@@ -1940,26 +2040,21 @@ LRESULT CALLBACK MSTaskListWClass_SubclassProc(
         BOOL bShouldDraw = bShowCombinedWindowCount && (bOldTaskbar >= 1 && bOldTaskbar != (DWORD)-1);
         if (bShouldDraw)
         {
-            MSTaskListWClass_UpdateBadgeOverlay(hWnd);
-        }
-        else
-        {
-            TaskbarBadgeData* pData = GetTaskbarBadgeData(hWnd, FALSE);
-            if (pData && pData->hOverlay && IsWindow(pData->hOverlay))
-            {
-                ShowWindow(pData->hOverlay, SW_HIDE);
-            }
+            // Draw badges directly onto the taskbar (no overlay window)
+            MSTaskListWClass_DrawBadgesDirect(hWnd);
         }
         return 0;
     }
     else if (uMsg == WM_PAINT || uMsg == WM_SIZE || uMsg == WM_WINDOWPOSCHANGED)
     {
         LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
-        // Schedule update after a delay to batch updates (use 200ms to reduce frequency)
+        
+        // Draw badges directly on the taskbar after paint (no overlay window)
         BOOL bShouldDraw = bShowCombinedWindowCount && (bOldTaskbar >= 1 && bOldTaskbar != (DWORD)-1);
-        if (bShouldDraw)
+        if (bShouldDraw && uMsg == WM_PAINT)
         {
-            SetTimer(hWnd, MSTASKLISTWCLASS_BADGE_TIMER_ID, 200, NULL);
+            // Use a short timer to draw after the paint is fully complete
+            SetTimer(hWnd, MSTASKLISTWCLASS_BADGE_TIMER_ID, 50, NULL);
         }
         return result;
     }
