@@ -1320,6 +1320,75 @@ LRESULT CALLBACK BadgeOverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
 {
     switch (uMsg)
     {
+    case WM_CREATE:
+        // Start a timer to periodically re-assert z-order (needed when thumbnail preview appears)
+        SetTimer(hWnd, 1, 100, NULL);
+        return 0;
+    case WM_TIMER:
+        if (wParam == 1)
+        {
+            BOOL bShouldHide = FALSE;
+            
+            // Check for full-screen mode
+            QUERY_USER_NOTIFICATION_STATE quns = QUNS_ACCEPTS_NOTIFICATIONS;
+            if (SUCCEEDED(SHQueryUserNotificationState(&quns)))
+            {
+                if (quns == QUNS_RUNNING_D3D_FULL_SCREEN || quns == QUNS_BUSY)
+                {
+                    bShouldHide = TRUE;
+                }
+            }
+            
+            // Also check if parent taskbar is off-screen (auto-hide or full-screen)
+            if (!bShouldHide)
+            {
+                HWND hTaskbar = GetParent(hWnd);
+                if (hTaskbar)
+                {
+                    RECT rcTaskbar;
+                    if (GetWindowRect(hTaskbar, &rcTaskbar))
+                    {
+                        HMONITOR hMon = MonitorFromWindow(hTaskbar, MONITOR_DEFAULTTONEAREST);
+                        if (hMon)
+                        {
+                            MONITORINFO mi = { sizeof(mi) };
+                            if (GetMonitorInfoW(hMon, &mi))
+                            {
+                                if (rcTaskbar.right <= mi.rcMonitor.left || 
+                                    rcTaskbar.left >= mi.rcMonitor.right ||
+                                    rcTaskbar.bottom <= mi.rcMonitor.top || 
+                                    rcTaskbar.top >= mi.rcMonitor.bottom)
+                                {
+                                    bShouldHide = TRUE;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (bShouldHide)
+            {
+                if (IsWindowVisible(hWnd))
+                {
+                    ShowWindow(hWnd, SW_HIDE);
+                }
+            }
+            else
+            {
+                // Show window if it was hidden and should now be visible
+                if (!IsWindowVisible(hWnd))
+                {
+                    ShowWindow(hWnd, SW_SHOWNOACTIVATE);
+                }
+                // Re-assert topmost z-order to stay above thumbnail preview popups
+                SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+        return 0;
+    case WM_DESTROY:
+        KillTimer(hWnd, 1);
+        return 0;
     case WM_WINDOWPOSCHANGING:
     {
         // Always stay on top - prevent being pushed down by other windows
@@ -1598,6 +1667,52 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
     }
     if (bOldTaskbar == 0 || bOldTaskbar == (DWORD)-1) return;
     
+    // Check if taskbar is visible (hide badge in full-screen mode)
+    // Use SHQueryUserNotificationState to detect full-screen apps
+    QUERY_USER_NOTIFICATION_STATE quns = QUNS_ACCEPTS_NOTIFICATIONS;
+    if (SUCCEEDED(SHQueryUserNotificationState(&quns)))
+    {
+        if (quns == QUNS_RUNNING_D3D_FULL_SCREEN || quns == QUNS_BUSY)
+        {
+            // A full-screen app is running, hide the badge
+            if (pData->hOverlay && IsWindow(pData->hOverlay))
+            {
+                ShowWindow(pData->hOverlay, SW_HIDE);
+            }
+            return;
+        }
+    }
+    
+    // Also check if taskbar window is actually on screen
+    HWND hTaskbar = GetAncestor(hTaskListWnd, GA_ROOT);
+    if (hTaskbar)
+    {
+        RECT rcTaskbar;
+        if (GetWindowRect(hTaskbar, &rcTaskbar))
+        {
+            HMONITOR hMon = MonitorFromWindow(hTaskbar, MONITOR_DEFAULTTONEAREST);
+            if (hMon)
+            {
+                MONITORINFO mi = { sizeof(mi) };
+                if (GetMonitorInfoW(hMon, &mi))
+                {
+                    // Check if taskbar is completely outside the monitor bounds (hidden)
+                    if (rcTaskbar.right <= mi.rcMonitor.left || 
+                        rcTaskbar.left >= mi.rcMonitor.right ||
+                        rcTaskbar.bottom <= mi.rcMonitor.top || 
+                        rcTaskbar.top >= mi.rcMonitor.bottom)
+                    {
+                        if (pData->hOverlay && IsWindow(pData->hOverlay))
+                        {
+                            ShowWindow(pData->hOverlay, SW_HIDE);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    
     // Register overlay class if needed
     if (!g_bBadgeClassRegistered)
     {
@@ -1760,7 +1875,6 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
     // Update or create overlay window
     if (pData->badgeCount > 0)
     {
-        HWND hTaskbar = GetAncestor(hTaskListWnd, GA_ROOT);
         BOOL bNewlyCreated = FALSE;
         
         if (!pData->hOverlay || !IsWindow(pData->hOverlay))
