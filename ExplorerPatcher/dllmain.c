@@ -2045,16 +2045,15 @@ LRESULT CALLBACK MSTaskListWClass_SubclassProc(
         }
         return 0;
     }
-    else if (uMsg == WM_PAINT || uMsg == WM_SIZE || uMsg == WM_WINDOWPOSCHANGED)
+    else if (uMsg == WM_PAINT)
     {
         LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
         
-        // Draw badges directly on the taskbar after paint (no overlay window)
+        // Draw badges immediately after paint completes (no timer delay)
         BOOL bShouldDraw = bShowCombinedWindowCount && (bOldTaskbar >= 1 && bOldTaskbar != (DWORD)-1);
-        if (bShouldDraw && uMsg == WM_PAINT)
+        if (bShouldDraw)
         {
-            // Use a short timer to draw after the paint is fully complete
-            SetTimer(hWnd, MSTASKLISTWCLASS_BADGE_TIMER_ID, 50, NULL);
+            MSTaskListWClass_DrawBadgesDirect(hWnd);
         }
         return result;
     }
