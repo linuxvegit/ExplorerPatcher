@@ -106,6 +106,35 @@ GpStatus WINAPI GdipSetPixelOffsetMode(GpGraphics*, int);
 enum { CompositingQualityHighQuality = 2 };
 enum { PixelOffsetModeHighQuality = 2 };
 
+// GDI+ startup/shutdown
+typedef struct {
+    UINT32 GdiplusVersion;
+    void*  DebugEventCallback;
+    BOOL   SuppressBackgroundThread;
+    BOOL   SuppressExternalCodecs;
+} GdiplusStartupInput;
+GpStatus WINAPI GdiplusStartup(ULONG_PTR*, const GdiplusStartupInput*, void*);
+void     WINAPI GdiplusShutdown(ULONG_PTR);
+
+static ULONG_PTR g_gdiplusToken = 0;
+static BOOL g_gdiplusInitialized = FALSE;
+static BOOL g_gdiplusInitAttempted = FALSE;
+
+static BOOL EnsureGdiplusInitialized(void)
+{
+    if (g_gdiplusInitialized) return TRUE;
+    if (g_gdiplusInitAttempted) return FALSE;  // Already failed once
+    g_gdiplusInitAttempted = TRUE;
+    GdiplusStartupInput input = { 0 };
+    input.GdiplusVersion = 1;
+    if (GdiplusStartup(&g_gdiplusToken, &input, NULL) == Ok)
+    {
+        g_gdiplusInitialized = TRUE;
+        return TRUE;
+    }
+    return FALSE;
+}
+
 #define CHECKFOREGROUNDELAPSED_TIMEOUT 300
 #define POPUPMENU_SAFETOREMOVE_TIMEOUT 300
 #define POPUPMENU_BLUETOOTH_TIMEOUT 700
@@ -1161,6 +1190,7 @@ typedef struct {
     BadgeInfo prevBadges[MAX_BADGES];
     int badgeCount;
     int prevBadgeCount;
+    BOOL bTimerRunning;          // Whether the periodic update timer is active
 } TaskbarBadgeData;
 
 static TaskbarBadgeData g_taskbarBadges[MAX_TASKBARS];
@@ -1315,32 +1345,51 @@ static int ParseWindowCountFromName(BSTR bstrName)
     return count;
 }
 
+// Check if a foreground window is covering the full screen (F11 fullscreen or D3D exclusive)
+static BOOL IsForegroundFullScreen(void)
+{
+    // D3D exclusive fullscreen
+    QUERY_USER_NOTIFICATION_STATE quns = QUNS_ACCEPTS_NOTIFICATIONS;
+    if (SUCCEEDED(SHQueryUserNotificationState(&quns)))
+    {
+        if (quns == QUNS_RUNNING_D3D_FULL_SCREEN)
+            return TRUE;
+    }
+    
+    // Windowed fullscreen (F11 in browsers, etc.)
+    HWND hFg = GetForegroundWindow();
+    if (!hFg) return FALSE;
+    
+    // Ignore desktop and shell windows
+    if (hFg == GetDesktopWindow() || hFg == GetShellWindow()) return FALSE;
+    
+    HMONITOR hMon = MonitorFromWindow(hFg, MONITOR_DEFAULTTONEAREST);
+    if (!hMon) return FALSE;
+    
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoW(hMon, &mi)) return FALSE;
+    
+    RECT rcWnd;
+    if (!GetWindowRect(hFg, &rcWnd)) return FALSE;
+    
+    // Window covers the entire monitor work area or screen area
+    return (rcWnd.left <= mi.rcMonitor.left && rcWnd.top <= mi.rcMonitor.top &&
+            rcWnd.right >= mi.rcMonitor.right && rcWnd.bottom >= mi.rcMonitor.bottom);
+}
+
 // Badge overlay window procedure - minimal, UpdateLayeredWindow handles drawing
 LRESULT CALLBACK BadgeOverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
     {
     case WM_CREATE:
-        // Start a timer to periodically re-assert z-order (needed when thumbnail preview appears)
-        SetTimer(hWnd, 1, 100, NULL);
+        // Timer to check fullscreen state
+        SetTimer(hWnd, 1, 500, NULL);
         return 0;
     case WM_TIMER:
         if (wParam == 1)
         {
-            BOOL bShouldHide = FALSE;
-            
-            // Only hide for D3D full-screen mode (exclusive full-screen games)
-            // For windowed full-screen (F11), the badge will be visible but the taskbar auto-hides anyway
-            QUERY_USER_NOTIFICATION_STATE quns = QUNS_ACCEPTS_NOTIFICATIONS;
-            if (SUCCEEDED(SHQueryUserNotificationState(&quns)))
-            {
-                if (quns == QUNS_RUNNING_D3D_FULL_SCREEN)
-                {
-                    bShouldHide = TRUE;
-                }
-            }
-            
-            if (bShouldHide)
+            if (IsForegroundFullScreen())
             {
                 if (IsWindowVisible(hWnd))
                 {
@@ -1349,26 +1398,16 @@ LRESULT CALLBACK BadgeOverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
             }
             else
             {
-                // Show window if it was hidden and should now be visible
                 if (!IsWindowVisible(hWnd))
                 {
                     ShowWindow(hWnd, SW_SHOWNOACTIVATE);
                 }
-                // Re-assert topmost z-order to stay above thumbnail preview popups
-                SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
         return 0;
     case WM_DESTROY:
         KillTimer(hWnd, 1);
         return 0;
-    case WM_WINDOWPOSCHANGING:
-    {
-        // Always stay on top - prevent being pushed down by other windows
-        WINDOWPOS* pWP = (WINDOWPOS*)lParam;
-        pWP->hwndInsertAfter = HWND_TOPMOST;
-        return 0;
-    }
     case WM_NCHITTEST:
         return HTTRANSPARENT;  // Click through
     }
@@ -1397,10 +1436,11 @@ static void SaveBadgeState(TaskbarBadgeData* pData)
     memcpy(pData->prevBadges, pData->badges, sizeof(BadgeInfo) * pData->badgeCount);
 }
 
-// Render badges to overlay using UpdateLayeredWindow (flicker-free)
+// Render badges to overlay using UpdateLayeredWindow (flicker-free, anti-aliased)
 static void RenderBadgeOverlay(TaskbarBadgeData* pData, RECT* prcBounds)
 {
     if (!pData || !pData->hOverlay) return;
+    if (!EnsureGdiplusInitialized()) return;
     
     int width = prcBounds->right - prcBounds->left;
     int height = prcBounds->bottom - prcBounds->top;
@@ -1445,168 +1485,98 @@ static void RenderBadgeOverlay(TaskbarBadgeData* pData, RECT* prcBounds)
     // Clear to fully transparent
     memset(pvBits, 0, width * height * 4);
     
-    // Draw each badge using GDI+ for smooth anti-aliased rendering
-    for (int i = 0; i < pData->badgeCount; i++)
+    // Get Windows accent color (shared across all badges)
+    DWORD accentColor = 0;
+    BOOL opaque = FALSE;
+    if (FAILED(DwmGetColorizationColor(&accentColor, &opaque)))
     {
-        // Convert screen coordinates to bitmap coordinates
-        RECT rcBadge = pData->badges[i].rcBadge;
-        OffsetRect(&rcBadge, -prcBounds->left, -prcBounds->top);
-        
-        WCHAR wszCount[8];
-        swprintf_s(wszCount, 8, L"%d", pData->badges[i].count);
-        
-        // Get Windows accent color
-        DWORD accentColor = 0;
-        BOOL opaque = FALSE;
-        if (FAILED(DwmGetColorizationColor(&accentColor, &opaque)))
+        accentColor = 0x00D77800;  // Default blue if API fails
+    }
+    BYTE accentR = (accentColor >> 16) & 0xFF;
+    BYTE accentG = (accentColor >> 8) & 0xFF;
+    BYTE accentB = accentColor & 0xFF;
+    BYTE bgAlpha = 127;  // 50% transparency
+    
+    // Create GDI+ bitmap wrapping the DIB bits - once for all badges
+    GpBitmap* pGdipBitmap = NULL;
+    GpStatus status = GdipCreateBitmapFromScan0(width, height, width * 4, 
+        PixelFormat32bppPARGB, (BYTE*)pvBits, &pGdipBitmap);
+    
+    if (status == Ok && pGdipBitmap)
+    {
+        GpGraphics* pGraphics = NULL;
+        if (GdipGetImageGraphicsContext(pGdipBitmap, &pGraphics) == Ok && pGraphics)
         {
-            accentColor = 0x00D77800;  // Default blue if API fails
-        }
-        BYTE accentR = (accentColor >> 16) & 0xFF;
-        BYTE accentG = (accentColor >> 8) & 0xFF;
-        BYTE accentB = accentColor & 0xFF;
-        
-        BYTE bgAlpha = 127;  // 50% transparency
-        
-        // Create GDI+ bitmap from the DIB section scan0 for direct ARGB drawing
-        GpBitmap* pBitmap = NULL;
-        GpStatus status = GdipCreateBitmapFromScan0(width, height, width * 4, 
-            PixelFormat32bppPARGB, (BYTE*)pvBits, &pBitmap);
-        
-        if (status == Ok && pBitmap)
-        {
-            GpGraphics* pGraphics = NULL;
-            if (GdipGetImageGraphicsContext(pBitmap, &pGraphics) == Ok && pGraphics)
+            // Set high quality anti-aliased rendering once
+            GdipSetSmoothingMode(pGraphics, SmoothingModeAntiAlias);
+            GdipSetCompositingMode(pGraphics, CompositingModeSourceOver);
+            GdipSetCompositingQuality(pGraphics, CompositingQualityHighQuality);
+            GdipSetPixelOffsetMode(pGraphics, PixelOffsetModeHighQuality);
+            GdipSetTextRenderingHint(pGraphics, TextRenderingHintAntiAliasGridFit);
+            
+            // Create shared GDI+ resources
+            DWORD gdipBgColor = (bgAlpha << 24) | (accentR << 16) | (accentG << 8) | accentB;
+            GpSolidFill* pBgBrush = NULL;
+            GdipCreateSolidFill(gdipBgColor, &pBgBrush);
+            
+            GpSolidFill* pTextBrush = NULL;
+            GdipCreateSolidFill(0xFFFFFFFF, &pTextBrush);
+            
+            GpFontFamily* pFontFamily = NULL;
+            GdipCreateFontFamilyFromName(L"Segoe UI", NULL, &pFontFamily);
+            
+            GpFont* pFont = NULL;
+            if (pFontFamily)
+                GdipCreateFont(pFontFamily, (REAL)(11 * scale), FontStyleBold, UnitPixel, &pFont);
+            
+            GpStringFormat* pFormat = NULL;
+            GdipCreateStringFormat(0, LANG_NEUTRAL, &pFormat);
+            if (pFormat)
             {
-                // Set high quality rendering
-                GdipSetSmoothingMode(pGraphics, SmoothingModeHighQuality);
-                GdipSetCompositingMode(pGraphics, CompositingModeSourceOver);
-                GdipSetCompositingQuality(pGraphics, CompositingQualityHighQuality);
-                GdipSetPixelOffsetMode(pGraphics, PixelOffsetModeHighQuality);
+                GdipSetStringFormatAlign(pFormat, StringAlignmentCenter);
+                GdipSetStringFormatLineAlign(pFormat, StringAlignmentCenter);
+            }
+            
+            // Draw all badges with shared resources
+            for (int i = 0; i < pData->badgeCount; i++)
+            {
+                RECT rcBadge = pData->badges[i].rcBadge;
+                OffsetRect(&rcBadge, -prcBounds->left, -prcBounds->top);
                 
-                // Create brush with accent color AND the desired alpha (premultiplied)
-                // For premultiplied alpha: R,G,B channels must be multiplied by alpha
-                BYTE pmR = (accentR * bgAlpha) / 255;
-                BYTE pmG = (accentG * bgAlpha) / 255;
-                BYTE pmB = (accentB * bgAlpha) / 255;
-                DWORD brushColor = (bgAlpha << 24) | (pmR << 16) | (pmG << 8) | pmB;
-                
-                GpSolidFill* pBrush = NULL;
-                // Note: GDI+ expects non-premultiplied ARGB, it does the premultiplication
-                DWORD gdipColor = (bgAlpha << 24) | (accentR << 16) | (accentG << 8) | accentB;
-                GdipCreateSolidFill(gdipColor, &pBrush);
-                
-                if (pBrush)
+                // Draw filled ellipse with smooth anti-aliasing
+                if (pBgBrush)
                 {
-                    // Draw filled ellipse with smooth anti-aliasing
-                    GdipFillEllipse(pGraphics, pBrush, 
+                    GdipFillEllipse(pGraphics, pBgBrush, 
                         (REAL)rcBadge.left, (REAL)rcBadge.top, 
                         (REAL)(rcBadge.right - rcBadge.left), (REAL)(rcBadge.bottom - rcBadge.top));
-                    GdipDeleteBrush(pBrush);
                 }
                 
-                // Draw text with full opacity white
-                GdipSetTextRenderingHint(pGraphics, TextRenderingHintAntiAliasGridFit);
-                
-                GpSolidFill* pTextBrush = NULL;
-                GdipCreateSolidFill(0xFFFFFFFF, &pTextBrush);  // Full white
-                
-                GpFontFamily* pFontFamily = NULL;
-                GdipCreateFontFamilyFromName(L"Segoe UI", NULL, &pFontFamily);
-                
-                if (pFontFamily && pTextBrush)
+                // Draw count text
+                if (pFont && pTextBrush && pFormat)
                 {
-                    GpFont* pFont = NULL;
-                    GdipCreateFont(pFontFamily, (REAL)(11 * scale), FontStyleBold, UnitPixel, &pFont);
+                    WCHAR wszCount[8];
+                    swprintf_s(wszCount, 8, L"%d", pData->badges[i].count);
                     
-                    if (pFont)
-                    {
-                        GpStringFormat* pFormat = NULL;
-                        GdipCreateStringFormat(0, LANG_NEUTRAL, &pFormat);
-                        if (pFormat)
-                        {
-                            GdipSetStringFormatAlign(pFormat, StringAlignmentCenter);
-                            GdipSetStringFormatLineAlign(pFormat, StringAlignmentCenter);
-                            
-                            RectF layoutRect = { (REAL)rcBadge.left, (REAL)rcBadge.top, 
-                                (REAL)(rcBadge.right - rcBadge.left), (REAL)(rcBadge.bottom - rcBadge.top) };
-                            
-                            GdipDrawString(pGraphics, wszCount, -1, pFont, &layoutRect, pFormat, pTextBrush);
-                            GdipDeleteStringFormat(pFormat);
-                        }
-                        GdipDeleteFont(pFont);
-                    }
-                    GdipDeleteFontFamily(pFontFamily);
+                    RectF layoutRect = { (REAL)rcBadge.left, (REAL)rcBadge.top, 
+                        (REAL)(rcBadge.right - rcBadge.left), (REAL)(rcBadge.bottom - rcBadge.top) };
+                    
+                    GdipDrawString(pGraphics, wszCount, -1, pFont, &layoutRect, pFormat, pTextBrush);
                 }
-                if (pTextBrush) GdipDeleteBrush(pTextBrush);
-                
-                GdipDeleteGraphics(pGraphics);
             }
-            GdipDisposeImage(pBitmap);
+            
+            // Cleanup shared GDI+ resources
+            if (pFormat) GdipDeleteStringFormat(pFormat);
+            if (pFont) GdipDeleteFont(pFont);
+            if (pFontFamily) GdipDeleteFontFamily(pFontFamily);
+            if (pTextBrush) GdipDeleteBrush(pTextBrush);
+            if (pBgBrush) GdipDeleteBrush(pBgBrush);
+            
+            GdipDeleteGraphics(pGraphics);
         }
-        else
-        {
-            // Fallback to GDI if GDI+ bitmap creation fails
-            DWORD* pPixels = (DWORD*)pvBits;
-            HBRUSH hBrushBg = CreateSolidBrush(RGB(accentR, accentG, accentB));
-            HPEN hPenNull = CreatePen(PS_NULL, 0, 0);
-            HBRUSH hOldBrush = (HBRUSH)SelectObject(hdcMem, hBrushBg);
-            HPEN hOldPen = (HPEN)SelectObject(hdcMem, hPenNull);
-            Ellipse(hdcMem, rcBadge.left, rcBadge.top, rcBadge.right, rcBadge.bottom);
-            SelectObject(hdcMem, hOldBrush);
-            SelectObject(hdcMem, hOldPen);
-            DeleteObject(hBrushBg);
-            DeleteObject(hPenNull);
-            
-            // Manually set alpha
-            for (int y = max(0, rcBadge.top); y < min(height, rcBadge.bottom); y++)
-            {
-                for (int x = max(0, rcBadge.left); x < min(width, rcBadge.right); x++)
-                {
-                    DWORD* pPixel = &pPixels[y * width + x];
-                    BYTE b = (*pPixel) & 0xFF;
-                    BYTE g = (*pPixel >> 8) & 0xFF;
-                    BYTE r = (*pPixel >> 16) & 0xFF;
-                    if (r > 0 || g > 0 || b > 0)
-                    {
-                        r = (r * bgAlpha) / 255;
-                        g = (g * bgAlpha) / 255;
-                        b = (b * bgAlpha) / 255;
-                        *pPixel = (bgAlpha << 24) | (r << 16) | (g << 8) | b;
-                    }
-                }
-            }
-            
-            // GDI text fallback
-            SetBkMode(hdcMem, TRANSPARENT);
-            SetTextColor(hdcMem, RGB(255, 255, 255));
-            HFONT hFont = CreateFontW((int)(-11 * scale), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 
-                DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            HFONT hOldFont = (HFONT)SelectObject(hdcMem, hFont);
-            DrawTextW(hdcMem, wszCount, -1, &rcBadge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(hdcMem, hOldFont);
-            DeleteObject(hFont);
-            
-            // Set text pixels to full alpha
-            for (int y = max(0, rcBadge.top); y < min(height, rcBadge.bottom); y++)
-            {
-                for (int x = max(0, rcBadge.left); x < min(width, rcBadge.right); x++)
-                {
-                    DWORD* pPixel = &pPixels[y * width + x];
-                    BYTE b = (*pPixel) & 0xFF;
-                    BYTE g = (*pPixel >> 8) & 0xFF;
-                    BYTE r = (*pPixel >> 16) & 0xFF;
-                    if (r > 200 && g > 200 && b > 200)
-                    {
-                        *pPixel = (255 << 24) | (255 << 16) | (255 << 8) | 255;
-                    }
-                }
-            }
-        }
+        GdipDisposeImage(pGdipBitmap);
     }
     
-    // Update layered window
+    // Update layered window atomically (flicker-free)
     POINT ptSrc = { 0, 0 };
     POINT ptDst = { prcBounds->left, prcBounds->top };
     SIZE szWnd = { width, height };
@@ -1614,171 +1584,10 @@ static void RenderBadgeOverlay(TaskbarBadgeData* pData, RECT* prcBounds)
     
     UpdateLayeredWindow(pData->hOverlay, hdcScreen, &ptDst, &szWnd, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
     
-    // Ensure overlay stays on top (above thumbnail previews)
-    SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    
     SelectObject(hdcMem, hOldBitmap);
     DeleteObject(hBitmap);
     DeleteDC(hdcMem);
     ReleaseDC(NULL, hdcScreen);
-}
-
-// Draw badges directly on taskbar window (no overlay)
-void MSTaskListWClass_DrawBadgesDirect(HWND hTaskListWnd)
-{
-    if (!bShowCombinedWindowCount) return;
-    if (bOldTaskbar == 0 || bOldTaskbar == (DWORD)-1) return;
-    
-    // Initialize COM for UI Automation
-    HRESULT hrCom = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    BOOL bComInitialized = SUCCEEDED(hrCom) || hrCom == S_FALSE || hrCom == RPC_E_CHANGED_MODE;
-    if (!bComInitialized) return;
-    
-    IUIAutomation* pAutomation = NULL;
-    HRESULT hr = CoCreateInstance(&CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, &IID_IUIAutomation, (void**)&pAutomation);
-    if (FAILED(hr) || !pAutomation)
-    {
-        if (hrCom == S_OK) CoUninitialize();
-        return;
-    }
-    
-    IUIAutomationElement* pTaskListElement = NULL;
-    hr = pAutomation->lpVtbl->ElementFromHandle(pAutomation, hTaskListWnd, &pTaskListElement);
-    if (FAILED(hr) || !pTaskListElement)
-    {
-        pAutomation->lpVtbl->Release(pAutomation);
-        if (hrCom == S_OK) CoUninitialize();
-        return;
-    }
-    
-    IUIAutomationTreeWalker* pWalker = NULL;
-    hr = pAutomation->lpVtbl->get_ControlViewWalker(pAutomation, &pWalker);
-    if (FAILED(hr) || !pWalker)
-    {
-        pTaskListElement->lpVtbl->Release(pTaskListElement);
-        pAutomation->lpVtbl->Release(pAutomation);
-        if (hrCom == S_OK) CoUninitialize();
-        return;
-    }
-    
-    // Get DPI for calculations
-    UINT dpi = 96;
-    HMONITOR hMon = MonitorFromWindow(hTaskListWnd, MONITOR_DEFAULTTONEAREST);
-    if (hMon)
-    {
-        UINT dpiX, dpiY;
-        if (SUCCEEDED(GetDpiForMonitor(hMon, MDT_DEFAULT, &dpiX, &dpiY)))
-        {
-            dpi = dpiX;
-        }
-    }
-    double scale = (double)dpi / 96.0;
-    
-    // Get DC for direct drawing
-    HDC hdc = GetDC(hTaskListWnd);
-    if (!hdc)
-    {
-        pWalker->lpVtbl->Release(pWalker);
-        pTaskListElement->lpVtbl->Release(pTaskListElement);
-        pAutomation->lpVtbl->Release(pAutomation);
-        if (hrCom == S_OK) CoUninitialize();
-        return;
-    }
-    
-    // Get client rect origin for coordinate conversion
-    POINT ptOrigin = { 0, 0 };
-    ClientToScreen(hTaskListWnd, &ptOrigin);
-    
-    // Get Windows accent color
-    DWORD accentColor = 0;
-    BOOL opaque = FALSE;
-    if (FAILED(DwmGetColorizationColor(&accentColor, &opaque)))
-    {
-        accentColor = 0x00D77800;
-    }
-    BYTE accentR = (accentColor >> 16) & 0xFF;
-    BYTE accentG = (accentColor >> 8) & 0xFF;
-    BYTE accentB = accentColor & 0xFF;
-    
-    // Create GDI objects for drawing
-    HBRUSH hBrushBg = CreateSolidBrush(RGB(accentR, accentG, accentB));
-    HPEN hPenNull = CreatePen(PS_NULL, 0, 0);
-    HFONT hFont = CreateFontW(
-        (int)(-11 * scale), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI"
-    );
-    
-    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, hBrushBg);
-    HPEN hOldPen = (HPEN)SelectObject(hdc, hPenNull);
-    HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(255, 255, 255));
-    
-    IUIAutomationElement* pChild = NULL;
-    hr = pWalker->lpVtbl->GetFirstChildElement(pWalker, pTaskListElement, &pChild);
-    
-    while (SUCCEEDED(hr) && pChild)
-    {
-        BSTR bstrName = NULL;
-        pChild->lpVtbl->get_CurrentName(pChild, &bstrName);
-        
-        int count = ParseWindowCountFromName(bstrName);
-        
-        if (count > 1)
-        {
-            RECT rcButton = { 0 };
-            pChild->lpVtbl->get_CurrentBoundingRectangle(pChild, &rcButton);
-            
-            if (rcButton.right > rcButton.left && rcButton.bottom > rcButton.top)
-            {
-                WCHAR wszCount[8];
-                swprintf_s(wszCount, 8, L"%d", count);
-                
-                SIZE textSize;
-                GetTextExtentPoint32W(hdc, wszCount, (int)wcslen(wszCount), &textSize);
-                
-                int badgePadding = (int)(3 * scale);
-                int badgeTextWidth = textSize.cx + badgePadding * 2;
-                int badgeDiameter = max(badgeTextWidth, textSize.cy + badgePadding * 2);
-                badgeDiameter = max(badgeDiameter, (int)(16 * scale));
-                
-                // Convert screen coordinates to client coordinates
-                int buttonWidth = rcButton.right - rcButton.left;
-                int badgeX = (rcButton.left - ptOrigin.x) + (buttonWidth - badgeDiameter) / 2;
-                int badgeY = (rcButton.top - ptOrigin.y) + (int)(2 * scale);
-                
-                RECT rcBadge = { badgeX, badgeY, badgeX + badgeDiameter, badgeY + badgeDiameter };
-                
-                // Draw filled ellipse (badge background)
-                Ellipse(hdc, rcBadge.left, rcBadge.top, rcBadge.right, rcBadge.bottom);
-                
-                // Draw badge text
-                DrawTextW(hdc, wszCount, -1, &rcBadge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            }
-        }
-        
-        if (bstrName) SysFreeString(bstrName);
-        
-        IUIAutomationElement* pNext = NULL;
-        pWalker->lpVtbl->GetNextSiblingElement(pWalker, pChild, &pNext);
-        pChild->lpVtbl->Release(pChild);
-        pChild = pNext;
-    }
-    
-    SelectObject(hdc, hOldBrush);
-    SelectObject(hdc, hOldPen);
-    SelectObject(hdc, hOldFont);
-    DeleteObject(hBrushBg);
-    DeleteObject(hPenNull);
-    DeleteObject(hFont);
-    ReleaseDC(hTaskListWnd, hdc);
-    
-    pWalker->lpVtbl->Release(pWalker);
-    pTaskListElement->lpVtbl->Release(pTaskListElement);
-    pAutomation->lpVtbl->Release(pAutomation);
-    
-    if (hrCom == S_OK) CoUninitialize();
 }
 
 // Update badge overlay with current button positions
@@ -1798,18 +1607,14 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
     }
     if (bOldTaskbar == 0 || bOldTaskbar == (DWORD)-1) return;
     
-    // Check if in D3D full-screen mode (hide badge for exclusive full-screen games)
-    QUERY_USER_NOTIFICATION_STATE quns = QUNS_ACCEPTS_NOTIFICATIONS;
-    if (SUCCEEDED(SHQueryUserNotificationState(&quns)))
+    // Hide badge when a fullscreen window is active (D3D exclusive or F11 windowed fullscreen)
+    if (IsForegroundFullScreen())
     {
-        if (quns == QUNS_RUNNING_D3D_FULL_SCREEN)
+        if (pData->hOverlay && IsWindow(pData->hOverlay))
         {
-            if (pData->hOverlay && IsWindow(pData->hOverlay))
-            {
-                ShowWindow(pData->hOverlay, SW_HIDE);
-            }
-            return;
+            ShowWindow(pData->hOverlay, SW_HIDE);
         }
+        return;
     }
     
     // Register overlay class if needed
@@ -1956,15 +1761,20 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
     // Check if badge data has changed
     BOOL bDataChanged = BadgeDataChanged(pData);
     
-    // Always ensure z-order even if data hasn't changed (thumbnail previews can cover us)
-    if (pData->hOverlay && IsWindow(pData->hOverlay) && pData->badgeCount > 0)
-    {
-        SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    }
-    
-    // Skip re-rendering if unchanged
+    // Skip re-rendering if unchanged, but still ensure z-order if overlay is
+    // behind a thumbnail preview popup
     if (!bDataChanged && pData->hOverlay && IsWindow(pData->hOverlay))
     {
+        if (pData->badgeCount > 0 && IsWindowVisible(pData->hOverlay))
+        {
+            // Check if overlay is behind anything by seeing if a thumbnail popup exists.
+            // Only call SetWindowPos when needed (not unconditionally) to avoid flicker.
+            HWND hAbove = GetWindow(pData->hOverlay, GW_HWNDPREV);
+            if (hAbove != NULL)
+            {
+                SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
         return;
     }
     
@@ -1979,6 +1789,10 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
         
         if (!pData->hOverlay || !IsWindow(pData->hOverlay))
         {
+            // Create as owned by the taskbar root window. This is critical for
+            // Aero Peek: DWM keeps the taskbar and its owned windows visible
+            // during Peek, so the badge won't disappear when the user peeks
+            // at a window through its thumbnail preview.
             pData->hOverlay = CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                 MSTASKLISTWCLASS_BADGE_OVERLAY_CLASS,
@@ -1990,6 +1804,13 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
                 hModule,
                 NULL
             );
+            if (pData->hOverlay)
+            {
+                // Also exclude from Peek as belt-and-suspenders
+                BOOL bExclude = TRUE;
+                DwmSetWindowAttribute(pData->hOverlay, DWMWA_EXCLUDED_FROM_PEEK,
+                    &bExclude, sizeof(bExclude));
+            }
             bNewlyCreated = TRUE;
         }
         
@@ -2003,6 +1824,9 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
             {
                 ShowWindow(pData->hOverlay, SW_SHOWNOACTIVATE);
             }
+            
+            // Assert z-order once after render/show (not on a timer to avoid flicker)
+            SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
     }
     else
@@ -2016,6 +1840,7 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
 }
 
 // MSTaskListWClass subclass procedure for drawing window count badges
+// Uses a separate layered overlay window to avoid flicker and provide anti-aliased rendering
 LRESULT CALLBACK MSTaskListWClass_SubclassProc(
     _In_ HWND hWnd,
     _In_ UINT uMsg,
@@ -2034,14 +1859,20 @@ LRESULT CALLBACK MSTaskListWClass_SubclassProc(
     }
     else if (uMsg == WM_TIMER && wParam == MSTASKLISTWCLASS_BADGE_TIMER_ID)
     {
-        // Kill timer - we use one-shot timers to avoid buildup
-        KillTimer(hWnd, MSTASKLISTWCLASS_BADGE_TIMER_ID);
-        
+        // Periodic timer - update the overlay window (flicker-free, anti-aliased)
         BOOL bShouldDraw = bShowCombinedWindowCount && (bOldTaskbar >= 1 && bOldTaskbar != (DWORD)-1);
         if (bShouldDraw)
         {
-            // Draw badges directly onto the taskbar (no overlay window)
-            MSTaskListWClass_DrawBadgesDirect(hWnd);
+            MSTaskListWClass_UpdateBadgeOverlay(hWnd);
+        }
+        else
+        {
+            // Feature disabled at runtime - hide overlay if it exists
+            TaskbarBadgeData* pData = GetTaskbarBadgeData(hWnd, FALSE);
+            if (pData && pData->hOverlay && IsWindow(pData->hOverlay))
+            {
+                ShowWindow(pData->hOverlay, SW_HIDE);
+            }
         }
         return 0;
     }
@@ -2049,11 +1880,19 @@ LRESULT CALLBACK MSTaskListWClass_SubclassProc(
     {
         LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
         
-        // Draw badges immediately after paint completes (no timer delay)
-        BOOL bShouldDraw = bShowCombinedWindowCount && (bOldTaskbar >= 1 && bOldTaskbar != (DWORD)-1);
-        if (bShouldDraw)
+        // Start the periodic badge overlay update timer and do an immediate first update.
+        // The overlay is a separate layered window, so it persists across taskbar
+        // repaints and never flickers. The timer handles position/count updates.
+        if (bShowCombinedWindowCount && (bOldTaskbar >= 1 && bOldTaskbar != (DWORD)-1))
         {
-            MSTaskListWClass_DrawBadgesDirect(hWnd);
+            TaskbarBadgeData* pData = GetTaskbarBadgeData(hWnd, TRUE);
+            if (pData && !pData->bTimerRunning)
+            {
+                // Immediate first update so badges appear without waiting for timer
+                MSTaskListWClass_UpdateBadgeOverlay(hWnd);
+                SetTimer(hWnd, MSTASKLISTWCLASS_BADGE_TIMER_ID, 300, NULL);
+                pData->bTimerRunning = TRUE;
+            }
         }
         return result;
     }
