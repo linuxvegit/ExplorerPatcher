@@ -1171,6 +1171,7 @@ int GetTaskGroupWindowCount(ITaskGroup* pTaskGroup)
 }
 
 #define MSTASKLISTWCLASS_BADGE_TIMER_ID 12345
+#define WIN11_BADGE_TIMER_ID 12346
 #define MSTASKLISTWCLASS_BADGE_OVERLAY_CLASS L"EP_TaskbarBadgeOverlay"
 
 // Badge overlay window - stores badge info
@@ -1897,6 +1898,286 @@ LRESULT CALLBACK MSTaskListWClass_SubclassProc(
         return result;
     }
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+// Win11 taskbar badge overlay - uses UI Automation on Shell_TrayWnd to find XAML taskbar buttons
+void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
+{
+    // Get or create per-taskbar data (reuse same infrastructure as Win10)
+    TaskbarBadgeData* pData = GetTaskbarBadgeData(hShellTrayWnd, TRUE);
+    if (!pData) return;
+
+    if (!bShowCombinedWindowCount)
+    {
+        if (pData->hOverlay && IsWindow(pData->hOverlay))
+        {
+            ShowWindow(pData->hOverlay, SW_HIDE);
+        }
+        return;
+    }
+    // Only for Win11 taskbar
+    if (bOldTaskbar != 0) return;
+
+    // Hide badge when a fullscreen window is active
+    if (IsForegroundFullScreen())
+    {
+        if (pData->hOverlay && IsWindow(pData->hOverlay))
+        {
+            ShowWindow(pData->hOverlay, SW_HIDE);
+        }
+        return;
+    }
+
+    // Register overlay class if needed
+    if (!g_bBadgeClassRegistered)
+    {
+        WNDCLASSW wc = { 0 };
+        wc.lpfnWndProc = BadgeOverlayWndProc;
+        wc.hInstance = hModule;
+        wc.lpszClassName = MSTASKLISTWCLASS_BADGE_OVERLAY_CLASS;
+        wc.hbrBackground = NULL;
+        if (RegisterClassW(&wc))
+        {
+            g_bBadgeClassRegistered = TRUE;
+        }
+    }
+
+    // Initialize COM for UI Automation
+    HRESULT hrCom = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    BOOL bComInitialized = SUCCEEDED(hrCom) || hrCom == S_FALSE || hrCom == RPC_E_CHANGED_MODE;
+    if (!bComInitialized) return;
+
+    IUIAutomation* pAutomation = NULL;
+    HRESULT hr = CoCreateInstance(&CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, &IID_IUIAutomation, (void**)&pAutomation);
+    if (FAILED(hr) || !pAutomation)
+    {
+        if (hrCom == S_OK) CoUninitialize();
+        return;
+    }
+
+    // Get the Shell_TrayWnd as automation element
+    IUIAutomationElement* pTrayElement = NULL;
+    hr = pAutomation->lpVtbl->ElementFromHandle(pAutomation, hShellTrayWnd, &pTrayElement);
+    if (FAILED(hr) || !pTrayElement)
+    {
+        pAutomation->lpVtbl->Release(pAutomation);
+        if (hrCom == S_OK) CoUninitialize();
+        return;
+    }
+
+    // For Win11, we need to walk deeper into the XAML tree to find taskbar buttons.
+    // The tree structure is: Shell_TrayWnd -> ... -> Taskbar.TaskListButtonAutomationPeer elements
+    // We use a recursive tree walker and filter by checking each element's name for window count patterns.
+    IUIAutomationTreeWalker* pWalker = NULL;
+    hr = pAutomation->lpVtbl->get_ControlViewWalker(pAutomation, &pWalker);
+    if (FAILED(hr) || !pWalker)
+    {
+        pTrayElement->lpVtbl->Release(pTrayElement);
+        pAutomation->lpVtbl->Release(pAutomation);
+        if (hrCom == S_OK) CoUninitialize();
+        return;
+    }
+
+    // Collect badge info
+    pData->badgeCount = 0;
+    RECT rcBounds = { MAXLONG, MAXLONG, MINLONG, MINLONG };
+
+    // Get DPI for calculations
+    UINT dpi = 96;
+    HMONITOR hMon = MonitorFromWindow(hShellTrayWnd, MONITOR_DEFAULTTONEAREST);
+    if (hMon)
+    {
+        UINT dpiX, dpiY;
+        if (SUCCEEDED(GetDpiForMonitor(hMon, MDT_DEFAULT, &dpiX, &dpiY)))
+        {
+            dpi = dpiX;
+        }
+    }
+    double scale = (double)dpi / 96.0;
+
+    // Temporary DC for text measurement
+    HDC hdcTemp = GetDC(NULL);
+    HFONT hFont = CreateFontW(
+        (int)(-11 * scale), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI"
+    );
+    HFONT hOldFont = (HFONT)SelectObject(hdcTemp, hFont);
+
+    // Walk the tree recursively to find taskbar buttons with window counts.
+    // Use a stack-based approach to avoid deep recursion.
+    // The Win11 taskbar button list is typically 3-4 levels deep in the automation tree.
+    #define MAX_WALK_STACK 32
+    IUIAutomationElement* walkStack[MAX_WALK_STACK];
+    int walkDepth = 0;
+
+    // Start with first child of the tray element
+    IUIAutomationElement* pChild = NULL;
+    hr = pWalker->lpVtbl->GetFirstChildElement(pWalker, pTrayElement, &pChild);
+
+    // Push root children onto the stack
+    while (SUCCEEDED(hr) && pChild && walkDepth < MAX_WALK_STACK)
+    {
+        walkStack[walkDepth++] = pChild;
+        IUIAutomationElement* pNext = NULL;
+        pWalker->lpVtbl->GetNextSiblingElement(pWalker, pChild, &pNext);
+        pChild = pNext;
+    }
+
+    while (walkDepth > 0 && pData->badgeCount < MAX_BADGES)
+    {
+        IUIAutomationElement* pElem = walkStack[--walkDepth];
+
+        // Check this element's name for window count
+        BSTR bstrName = NULL;
+        pElem->lpVtbl->get_CurrentName(pElem, &bstrName);
+
+        int count = ParseWindowCountFromName(bstrName);
+
+        if (count > 1)
+        {
+            RECT rcButton = { 0 };
+            pElem->lpVtbl->get_CurrentBoundingRectangle(pElem, &rcButton);
+
+            if (rcButton.right > rcButton.left && rcButton.bottom > rcButton.top)
+            {
+                WCHAR wszCount[8];
+                swprintf_s(wszCount, 8, L"%d", count);
+
+                SIZE textSize;
+                GetTextExtentPoint32W(hdcTemp, wszCount, (int)wcslen(wszCount), &textSize);
+
+                int badgePadding = (int)(3 * scale);
+                int badgeTextWidth = textSize.cx + badgePadding * 2;
+                int badgeDiameter = max(badgeTextWidth, textSize.cy + badgePadding * 2);
+                badgeDiameter = max(badgeDiameter, (int)(16 * scale));
+
+                // Position badge at top-left corner of the button (Win11 style)
+                int badgeX = rcButton.left + (int)(2 * scale);
+                int badgeY = rcButton.top + (int)(2 * scale);
+                int badgeWidth = badgeDiameter;
+                int badgeHeight = badgeDiameter;
+
+                pData->badges[pData->badgeCount].rcBadge.left = badgeX;
+                pData->badges[pData->badgeCount].rcBadge.top = badgeY;
+                pData->badges[pData->badgeCount].rcBadge.right = badgeX + badgeWidth;
+                pData->badges[pData->badgeCount].rcBadge.bottom = badgeY + badgeHeight;
+                pData->badges[pData->badgeCount].count = count;
+                pData->badgeCount++;
+
+                // Expand bounds
+                if (badgeX < rcBounds.left) rcBounds.left = badgeX;
+                if (badgeY < rcBounds.top) rcBounds.top = badgeY;
+                if (badgeX + badgeWidth > rcBounds.right) rcBounds.right = badgeX + badgeWidth;
+                if (badgeY + badgeHeight > rcBounds.bottom) rcBounds.bottom = badgeY + badgeHeight;
+            }
+        }
+
+        if (bstrName) SysFreeString(bstrName);
+
+        // Push children of this element (if we haven't found a badge here, descend deeper)
+        if (count <= 1)
+        {
+            IUIAutomationElement* pFirstChild = NULL;
+            if (SUCCEEDED(pWalker->lpVtbl->GetFirstChildElement(pWalker, pElem, &pFirstChild)) && pFirstChild)
+            {
+                IUIAutomationElement* pSibling = pFirstChild;
+                while (pSibling && walkDepth < MAX_WALK_STACK)
+                {
+                    walkStack[walkDepth++] = pSibling;
+                    IUIAutomationElement* pNextSibling = NULL;
+                    pWalker->lpVtbl->GetNextSiblingElement(pWalker, pSibling, &pNextSibling);
+                    pSibling = pNextSibling;
+                }
+            }
+        }
+
+        pElem->lpVtbl->Release(pElem);
+    }
+
+    // Clean up any remaining elements on the stack
+    for (int s = 0; s < walkDepth; s++)
+    {
+        walkStack[s]->lpVtbl->Release(walkStack[s]);
+    }
+    walkDepth = 0;
+    #undef MAX_WALK_STACK
+
+    SelectObject(hdcTemp, hOldFont);
+    DeleteObject(hFont);
+    ReleaseDC(NULL, hdcTemp);
+
+    pWalker->lpVtbl->Release(pWalker);
+    pTrayElement->lpVtbl->Release(pTrayElement);
+    pAutomation->lpVtbl->Release(pAutomation);
+
+    if (hrCom == S_OK) CoUninitialize();
+
+    // Check if badge data has changed
+    BOOL bDataChanged = BadgeDataChanged(pData);
+
+    if (!bDataChanged && pData->hOverlay && IsWindow(pData->hOverlay))
+    {
+        if (pData->badgeCount > 0 && IsWindowVisible(pData->hOverlay))
+        {
+            HWND hAbove = GetWindow(pData->hOverlay, GW_HWNDPREV);
+            if (hAbove != NULL)
+            {
+                SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+        return;
+    }
+
+    // Save current state for next comparison
+    SaveBadgeState(pData);
+
+    // Update or create overlay window
+    if (pData->badgeCount > 0)
+    {
+        BOOL bNewlyCreated = FALSE;
+
+        if (!pData->hOverlay || !IsWindow(pData->hOverlay))
+        {
+            pData->hOverlay = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                MSTASKLISTWCLASS_BADGE_OVERLAY_CLASS,
+                NULL,
+                WS_POPUP,
+                0, 0, 1, 1,
+                hShellTrayWnd,
+                NULL,
+                hModule,
+                NULL
+            );
+            if (pData->hOverlay)
+            {
+                BOOL bExclude = TRUE;
+                DwmSetWindowAttribute(pData->hOverlay, DWMWA_EXCLUDED_FROM_PEEK,
+                    &bExclude, sizeof(bExclude));
+            }
+            bNewlyCreated = TRUE;
+        }
+
+        if (pData->hOverlay)
+        {
+            RenderBadgeOverlay(pData, &rcBounds);
+
+            if (bNewlyCreated || !IsWindowVisible(pData->hOverlay))
+            {
+                ShowWindow(pData->hOverlay, SW_SHOWNOACTIVATE);
+            }
+
+            SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+    else
+    {
+        if (pData->hOverlay && IsWindow(pData->hOverlay))
+        {
+            ShowWindow(pData->hOverlay, SW_HIDE);
+        }
+    }
 }
 
 void Win10TaskbarHooks_ConditionalPatchITaskGroupVtbl(ITaskGroupVtbl* pVtbl)
@@ -2752,6 +3033,8 @@ INT64 Shell_TrayWndSubclassProc(
             {
                 UnhookWindowsHookEx(Shell_TrayWndMouseHook);
             }
+            KillTimer(hWnd, WIN11_BADGE_TIMER_ID);
+            RemoveTaskbarBadgeData(hWnd);
             RemoveWindowSubclass(hWnd, Shell_TrayWndSubclassProc, Shell_TrayWndSubclassProc);
             break;
         }
@@ -2806,6 +3089,27 @@ INT64 Shell_TrayWndSubclassProc(
             if (bIsPrimaryTaskbar)
             {
                 UpdateStartMenuPositioning(MAKELPARAM(TRUE, FALSE));
+            }
+            break;
+        }
+        case WM_TIMER:
+        {
+            if (wParam == WIN11_BADGE_TIMER_ID)
+            {
+                if (bShowCombinedWindowCount && bOldTaskbar == 0)
+                {
+                    Win11Taskbar_UpdateBadgeOverlay(hWnd);
+                }
+                else
+                {
+                    // Feature disabled or not Win11 taskbar - hide overlay if it exists
+                    TaskbarBadgeData* pData = GetTaskbarBadgeData(hWnd, FALSE);
+                    if (pData && pData->hOverlay && IsWindow(pData->hOverlay))
+                    {
+                        ShowWindow(pData->hOverlay, SW_HIDE);
+                    }
+                }
+                return 0;
             }
             break;
         }
@@ -7982,10 +8286,13 @@ HWND CreateWindowExWHook(
     {
         SetWindowSubclass(hWnd, Shell_TrayWndSubclassProc, Shell_TrayWndSubclassProc, TRUE);
         Shell_TrayWndMouseHook = SetWindowsHookExW(WH_MOUSE, Shell_TrayWndMouseProc, NULL, GetCurrentThreadId());
+        // Start Win11 badge timer unconditionally - the handler checks bOldTaskbar at runtime
+        SetTimer(hWnd, WIN11_BADGE_TIMER_ID, 300, NULL);
     }
     else if (bIsExplorerProcess && (*((WORD*)&(lpClassName)+1)) && !wcscmp(lpClassName, L"Shell_SecondaryTrayWnd"))
     {
         SetWindowSubclass(hWnd, Shell_TrayWndSubclassProc, Shell_TrayWndSubclassProc, FALSE);
+        SetTimer(hWnd, WIN11_BADGE_TIMER_ID, 300, NULL);
     }
     else if (bIsExplorerProcess && (*((WORD*)&(lpClassName)+1)) && !_wcsicmp(lpClassName, L"ReBarWindow32") && hWndParent == FindWindowW(L"Shell_TrayWnd", NULL))
     {
