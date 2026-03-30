@@ -17,6 +17,12 @@ That's it!
 
 **Note:** Some features may be unavailable on some Windows versions.
 
+### Locak Build Command
+
+```cmd
+msbuild ExplorerPatcher.sln /property:Configuration=Release /property:Platform=IA-32;msbuild ExplorerPatcher.sln /property:Configuration=Release /property:Platform=amd64;.\build\Release\x64\ep_setup_patch.exe;start .\build\Release\x64\
+```
+
 ## Uninstalling
 
 * Right click the taskbar then click "Properties" or search for "ExplorerPatcher", and go to "Uninstall" section or
