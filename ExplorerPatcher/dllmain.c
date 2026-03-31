@@ -1356,23 +1356,32 @@ static BOOL IsForegroundFullScreen(void)
         if (quns == QUNS_RUNNING_D3D_FULL_SCREEN)
             return TRUE;
     }
-    
+
+    // If the taskbar is visible, we're not in fullscreen
+    HWND hTray = FindWindowW(L"Shell_TrayWnd", NULL);
+    if (hTray && IsWindowVisible(hTray))
+    {
+        RECT rcTray;
+        if (GetWindowRect(hTray, &rcTray) && (rcTray.bottom - rcTray.top) > 0)
+            return FALSE;
+    }
+
     // Windowed fullscreen (F11 in browsers, etc.)
     HWND hFg = GetForegroundWindow();
     if (!hFg) return FALSE;
-    
+
     // Ignore desktop and shell windows
     if (hFg == GetDesktopWindow() || hFg == GetShellWindow()) return FALSE;
-    
+
     HMONITOR hMon = MonitorFromWindow(hFg, MONITOR_DEFAULTTONEAREST);
     if (!hMon) return FALSE;
-    
+
     MONITORINFO mi = { sizeof(mi) };
     if (!GetMonitorInfoW(hMon, &mi)) return FALSE;
-    
+
     RECT rcWnd;
     if (!GetWindowRect(hFg, &rcWnd)) return FALSE;
-    
+
     // Window covers the entire monitor work area or screen area
     return (rcWnd.left <= mi.rcMonitor.left && rcWnd.top <= mi.rcMonitor.top &&
             rcWnd.right >= mi.rcMonitor.right && rcWnd.bottom >= mi.rcMonitor.bottom);
@@ -1383,32 +1392,6 @@ LRESULT CALLBACK BadgeOverlayWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
 {
     switch (uMsg)
     {
-    case WM_CREATE:
-        // Timer to check fullscreen state
-        SetTimer(hWnd, 1, 500, NULL);
-        return 0;
-    case WM_TIMER:
-        if (wParam == 1)
-        {
-            if (IsForegroundFullScreen())
-            {
-                if (IsWindowVisible(hWnd))
-                {
-                    ShowWindow(hWnd, SW_HIDE);
-                }
-            }
-            else
-            {
-                if (!IsWindowVisible(hWnd))
-                {
-                    ShowWindow(hWnd, SW_SHOWNOACTIVATE);
-                }
-            }
-        }
-        return 0;
-    case WM_DESTROY:
-        KillTimer(hWnd, 1);
-        return 0;
     case WM_NCHITTEST:
         return HTTRANSPARENT;  // Click through
     }
@@ -2113,18 +2096,50 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
 
     if (hrCom == S_OK) CoUninitialize();
 
+    // Debounce: only reject scans that return ZERO badges when we previously had
+    // badges. This handles click/Task View where button names temporarily lose
+    // the window count text. Nonzero decreases (e.g., 3→2 when a window is closed)
+    // are accepted immediately since the scan found the buttons with valid counts.
+    if (pData->badgeCount == 0 && pData->prevBadgeCount > 0)
+    {
+        // Scan found nothing — likely transient. Keep previous state.
+        pData->badgeCount = pData->prevBadgeCount;
+        memcpy(pData->badges, pData->prevBadges, sizeof(BadgeInfo) * pData->prevBadgeCount);
+
+        if (pData->hOverlay && IsWindow(pData->hOverlay))
+        {
+            if (!IsWindowVisible(pData->hOverlay))
+                ShowWindow(pData->hOverlay, SW_SHOWNOACTIVATE);
+            SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        return;
+    }
+
+    // Recompute bounds from badge data
+    rcBounds.left = MAXLONG; rcBounds.top = MAXLONG;
+    rcBounds.right = MINLONG; rcBounds.bottom = MINLONG;
+    for (int i = 0; i < pData->badgeCount; i++)
+    {
+        if (pData->badges[i].rcBadge.left < rcBounds.left) rcBounds.left = pData->badges[i].rcBadge.left;
+        if (pData->badges[i].rcBadge.top < rcBounds.top) rcBounds.top = pData->badges[i].rcBadge.top;
+        if (pData->badges[i].rcBadge.right > rcBounds.right) rcBounds.right = pData->badges[i].rcBadge.right;
+        if (pData->badges[i].rcBadge.bottom > rcBounds.bottom) rcBounds.bottom = pData->badges[i].rcBadge.bottom;
+    }
+
     // Check if badge data has changed
     BOOL bDataChanged = BadgeDataChanged(pData);
 
     if (!bDataChanged && pData->hOverlay && IsWindow(pData->hOverlay))
     {
-        if (pData->badgeCount > 0 && IsWindowVisible(pData->hOverlay))
+        if (pData->badgeCount > 0)
         {
-            HWND hAbove = GetWindow(pData->hOverlay, GW_HWNDPREV);
-            if (hAbove != NULL)
+            // Ensure overlay is visible and topmost even if data hasn't changed.
+            // Task View and other shell transitions can hide the overlay.
+            if (!IsWindowVisible(pData->hOverlay))
             {
-                SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                ShowWindow(pData->hOverlay, SW_SHOWNOACTIVATE);
             }
+            SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
         return;
     }
