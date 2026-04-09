@@ -1413,6 +1413,31 @@ static BOOL BadgeDataChanged(TaskbarBadgeData* pData)
     return FALSE;
 }
 
+// Compute overlap ratio of two RECTs relative to the smaller rect's area.
+// Returns a value in [0.0, 1.0]. Used to deduplicate badge entries that
+// refer to the same taskbar button at slightly different tree depths.
+static double RectOverlapRatio(const RECT* a, const RECT* b)
+{
+    // Intersection
+    int left   = max(a->left,   b->left);
+    int top    = max(a->top,    b->top);
+    int right  = min(a->right,  b->right);
+    int bottom = min(a->bottom, b->bottom);
+
+    if (left >= right || top >= bottom)
+        return 0.0;
+
+    double interArea = (double)(right - left) * (bottom - top);
+    double areaA = (double)(a->right - a->left) * (a->bottom - a->top);
+    double areaB = (double)(b->right - b->left) * (b->bottom - b->top);
+    double smaller = min(areaA, areaB);
+
+    if (smaller <= 0.0)
+        return 0.0;
+
+    return interArea / smaller;
+}
+
 // Save current badge state for change detection
 static void SaveBadgeState(TaskbarBadgeData* pData)
 {
@@ -2095,6 +2120,31 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
     pAutomation->lpVtbl->Release(pAutomation);
 
     if (hrCom == S_OK) CoUninitialize();
+
+    // Deduplicate badges whose screen rects overlap significantly.
+    // The recursive UIA tree walk can find the same taskbar button at
+    // multiple tree depths, producing duplicate badge entries.
+    for (int i = 0; i < pData->badgeCount; i++)
+    {
+        for (int j = i + 1; j < pData->badgeCount; )
+        {
+            if (RectOverlapRatio(&pData->badges[i].rcBadge,
+                                 &pData->badges[j].rcBadge) > 0.5)
+            {
+                // Remove entry j — shift remaining entries left
+                for (int k = j; k < pData->badgeCount - 1; k++)
+                {
+                    pData->badges[k] = pData->badges[k + 1];
+                }
+                pData->badgeCount--;
+                // Don't increment j — a new element slid into this slot
+            }
+            else
+            {
+                j++;
+            }
+        }
+    }
 
     // Debounce: only reject scans that return ZERO badges when we previously had
     // badges. This handles click/Task View where button names temporarily lose
