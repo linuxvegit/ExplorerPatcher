@@ -1495,15 +1495,18 @@ static void RenderBadgeOverlay(TaskbarBadgeData* pData, RECT* prcBounds)
     memset(pvBits, 0, width * height * 4);
     
     // Get Windows accent color (shared across all badges)
-    DWORD accentColor = 0;
-    BOOL opaque = FALSE;
-    if (FAILED(DwmGetColorizationColor(&accentColor, &opaque)))
+    IMMERSIVE_COLOR_PREFERENCE icp = { 0 };
+    BYTE accentR, accentG, accentB;
+    if (GetUserColorPreference && SUCCEEDED(GetUserColorPreference(&icp, false)))
     {
-        accentColor = 0x00D77800;  // Default blue if API fails
+        accentR = GetRValue(icp.crAccentColor);
+        accentG = GetGValue(icp.crAccentColor);
+        accentB = GetBValue(icp.crAccentColor);
     }
-    BYTE accentR = (accentColor >> 16) & 0xFF;
-    BYTE accentG = (accentColor >> 8) & 0xFF;
-    BYTE accentB = accentColor & 0xFF;
+    else
+    {
+        accentR = 0x00; accentG = 0x78; accentB = 0xD7;  // Default blue
+    }
     BYTE bgAlpha = 127;  // 50% transparency
     
     // Create GDI+ bitmap wrapping the DIB bits - once for all badges
