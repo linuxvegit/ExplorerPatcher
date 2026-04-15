@@ -1182,6 +1182,7 @@ typedef struct {
 
 #define MAX_BADGES 64
 #define MAX_TASKBARS 16
+#define BADGE_ZERO_CONFIRM_COUNT 3  // Consecutive zero-badge scans before accepting removal
 
 // Per-taskbar badge data
 typedef struct {
@@ -1192,6 +1193,7 @@ typedef struct {
     int badgeCount;
     int prevBadgeCount;
     BOOL bTimerRunning;          // Whether the periodic update timer is active
+    DWORD dwConsecutiveZeroScans; // Consecutive zero-badge scans for debounce
 } TaskbarBadgeData;
 
 static TaskbarBadgeData g_taskbarBadges[MAX_TASKBARS];
@@ -2149,23 +2151,33 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
         }
     }
 
-    // Debounce: only reject scans that return ZERO badges when we previously had
-    // badges. This handles click/Task View where button names temporarily lose
-    // the window count text. Nonzero decreases (e.g., 3→2 when a window is closed)
-    // are accepted immediately since the scan found the buttons with valid counts.
+    // Debounce: reject zero-badge scans that are likely transient UIA failures
+    // (e.g., Task View open, taskbar button click). After BADGE_ZERO_CONFIRM_COUNT
+    // consecutive zero scans, accept the result as legitimate removal.
     if (pData->badgeCount == 0 && pData->prevBadgeCount > 0)
     {
-        // Scan found nothing — likely transient. Keep previous state.
-        pData->badgeCount = pData->prevBadgeCount;
-        memcpy(pData->badges, pData->prevBadges, sizeof(BadgeInfo) * pData->prevBadgeCount);
-
-        if (pData->hOverlay && IsWindow(pData->hOverlay))
+        pData->dwConsecutiveZeroScans++;
+        if (pData->dwConsecutiveZeroScans < BADGE_ZERO_CONFIRM_COUNT)
         {
-            if (!IsWindowVisible(pData->hOverlay))
-                ShowWindow(pData->hOverlay, SW_SHOWNOACTIVATE);
-            SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            // Not enough consecutive zero scans yet -- keep previous state.
+            pData->badgeCount = pData->prevBadgeCount;
+            memcpy(pData->badges, pData->prevBadges, sizeof(BadgeInfo) * pData->prevBadgeCount);
+
+            if (pData->hOverlay && IsWindow(pData->hOverlay))
+            {
+                if (!IsWindowVisible(pData->hOverlay))
+                    ShowWindow(pData->hOverlay, SW_SHOWNOACTIVATE);
+                SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            return;
         }
-        return;
+        // Threshold met -- fall through to accept zero badges and hide overlay.
+        pData->dwConsecutiveZeroScans = 0;
+    }
+    else
+    {
+        // Non-zero scan -- reset the consecutive zero counter.
+        pData->dwConsecutiveZeroScans = 0;
     }
 
     // Recompute bounds from badge data
