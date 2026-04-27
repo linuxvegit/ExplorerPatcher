@@ -1348,45 +1348,62 @@ static int ParseWindowCountFromName(BSTR bstrName)
     return count;
 }
 
-// Check if a foreground window is covering the full screen (F11 fullscreen or D3D exclusive)
-static BOOL IsForegroundFullScreen(void)
+// Check if a foreground window covers the entire monitor that hTaskbarWnd lives on.
+// Detects F11/borderless fullscreen and D3D exclusive fullscreen. The unreliable
+// "Shell_TrayWnd visible -> not fullscreen" early-return has been removed because the
+// Win11 auto-hidden taskbar still reports IsWindowVisible == TRUE while slid off-screen.
+// hTaskbarWnd may be NULL; in that case the foreground window's monitor is used.
+static BOOL IsForegroundFullScreen(HWND hTaskbarWnd)
 {
-    // D3D exclusive fullscreen
+    // 1. Fast positive: exclusive D3D fullscreen
     QUERY_USER_NOTIFICATION_STATE quns = QUNS_ACCEPTS_NOTIFICATIONS;
-    if (SUCCEEDED(SHQueryUserNotificationState(&quns)))
-    {
-        if (quns == QUNS_RUNNING_D3D_FULL_SCREEN)
-            return TRUE;
-    }
+    if (SUCCEEDED(SHQueryUserNotificationState(&quns)) && quns == QUNS_RUNNING_D3D_FULL_SCREEN)
+        return TRUE;
 
-    // If the taskbar is visible, we're not in fullscreen
-    HWND hTray = FindWindowW(L"Shell_TrayWnd", NULL);
-    if (hTray && IsWindowVisible(hTray))
-    {
-        RECT rcTray;
-        if (GetWindowRect(hTray, &rcTray) && (rcTray.bottom - rcTray.top) > 0)
-            return FALSE;
-    }
-
-    // Windowed fullscreen (F11 in browsers, etc.)
+    // 2. Foreground window required for the geometry check
     HWND hFg = GetForegroundWindow();
     if (!hFg) return FALSE;
 
-    // Ignore desktop and shell windows
+    // 3. Resolve target monitor -- prefer the taskbar's monitor; fall back to foreground's
+    HMONITOR hMonTarget = hTaskbarWnd ? MonitorFromWindow(hTaskbarWnd, MONITOR_DEFAULTTONULL) : NULL;
+    if (!hMonTarget) hMonTarget = MonitorFromWindow(hFg, MONITOR_DEFAULTTONULL);
+    if (!hMonTarget) return FALSE;
+
+    // 4. Filter shell / desktop / our own / explorer-owned windows
     if (hFg == GetDesktopWindow() || hFg == GetShellWindow()) return FALSE;
 
-    HMONITOR hMon = MonitorFromWindow(hFg, MONITOR_DEFAULTTONEAREST);
-    if (!hMon) return FALSE;
+    WCHAR wszClass[64] = { 0 };
+    if (GetClassNameW(hFg, wszClass, ARRAYSIZE(wszClass)))
+    {
+        if (!wcscmp(wszClass, L"Shell_TrayWnd") ||
+            !wcscmp(wszClass, L"Shell_SecondaryTrayWnd") ||
+            !wcscmp(wszClass, L"WorkerW") ||
+            !wcscmp(wszClass, L"Progman") ||
+            !wcscmp(wszClass, MSTASKLISTWCLASS_BADGE_OVERLAY_CLASS))
+        {
+            return FALSE;
+        }
+    }
 
+    DWORD dwFgPid = 0;
+    GetWindowThreadProcessId(hFg, &dwFgPid);
+    if (dwFgPid && dwFgPid == GetCurrentProcessId()) return FALSE;
+
+    // 5. Same-monitor requirement (multi-monitor: don't hide badges on other displays)
+    HMONITOR hMonFg = MonitorFromWindow(hFg, MONITOR_DEFAULTTONULL);
+    if (hMonFg != hMonTarget) return FALSE;
+
+    // 6. Geometry check: foreground window covers the entire monitor
     MONITORINFO mi = { sizeof(mi) };
-    if (!GetMonitorInfoW(hMon, &mi)) return FALSE;
+    if (!GetMonitorInfoW(hMonTarget, &mi)) return FALSE;
 
     RECT rcWnd;
     if (!GetWindowRect(hFg, &rcWnd)) return FALSE;
 
-    // Window covers the entire monitor work area or screen area
-    return (rcWnd.left <= mi.rcMonitor.left && rcWnd.top <= mi.rcMonitor.top &&
-            rcWnd.right >= mi.rcMonitor.right && rcWnd.bottom >= mi.rcMonitor.bottom);
+    return (rcWnd.left   <= mi.rcMonitor.left   &&
+            rcWnd.top    <= mi.rcMonitor.top    &&
+            rcWnd.right  >= mi.rcMonitor.right  &&
+            rcWnd.bottom >= mi.rcMonitor.bottom);
 }
 
 // Badge overlay window procedure - minimal, UpdateLayeredWindow handles drawing
@@ -1622,7 +1639,7 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
     if (bOldTaskbar == 0 || bOldTaskbar == (DWORD)-1) return;
     
     // Hide badge when a fullscreen window is active (D3D exclusive or F11 windowed fullscreen)
-    if (IsForegroundFullScreen())
+    if (IsForegroundFullScreen(hTaskListWnd))
     {
         if (pData->hOverlay && IsWindow(pData->hOverlay))
         {
@@ -1932,7 +1949,7 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
     if (bOldTaskbar != 0) return;
 
     // Hide badge when a fullscreen window is active
-    if (IsForegroundFullScreen())
+    if (IsForegroundFullScreen(hShellTrayWnd))
     {
         if (pData->hOverlay && IsWindow(pData->hOverlay))
         {
