@@ -1173,6 +1173,7 @@ int GetTaskGroupWindowCount(ITaskGroup* pTaskGroup)
 #define MSTASKLISTWCLASS_BADGE_TIMER_ID 12345
 #define WIN11_BADGE_TIMER_ID 12346
 #define MSTASKLISTWCLASS_BADGE_OVERLAY_CLASS L"EP_TaskbarBadgeOverlay"
+#define WIN11_BADGE_SCAN_RESULT_MESSAGE L"ExplorerPatcher_Win11BadgeScanResult_" _T(EP_CLSID)
 
 // Badge overlay window - stores badge info
 typedef struct {
@@ -1194,13 +1195,22 @@ typedef struct {
     int prevBadgeCount;
     BOOL bTimerRunning;          // Whether the periodic update timer is active
     DWORD dwConsecutiveZeroScans; // Consecutive zero-badge scans for debounce
+    volatile LONG lWin11BadgeScanPending; // Win11 UIA scan is already queued/running
 } TaskbarBadgeData;
+
+typedef struct {
+    BadgeInfo badges[MAX_BADGES];
+    int badgeCount;
+} Win11BadgeScanResult;
 
 static TaskbarBadgeData g_taskbarBadges[MAX_TASKBARS];
 static int g_taskbarCount = 0;
 static BOOL g_bBadgeClassRegistered = FALSE;
 static CRITICAL_SECTION g_badgeLock;
 static BOOL g_bBadgeLockInitialized = FALSE;
+static UINT g_uWin11BadgeScanResultMessage = 0;
+
+static BOOL IsForegroundFullScreen(HWND hTaskbarWnd);
 
 // Get or create badge data for a taskbar window
 static TaskbarBadgeData* GetTaskbarBadgeData(HWND hTaskListWnd, BOOL bCreate)
@@ -1265,6 +1275,59 @@ static void RemoveTaskbarBadgeData(HWND hTaskListWnd)
     }
     
     LeaveCriticalSection(&g_badgeLock);
+}
+
+static UINT GetWin11BadgeScanResultMessage()
+{
+    if (!g_uWin11BadgeScanResultMessage)
+    {
+        g_uWin11BadgeScanResultMessage = RegisterWindowMessageW(WIN11_BADGE_SCAN_RESULT_MESSAGE);
+    }
+    return g_uWin11BadgeScanResultMessage;
+}
+
+static void SetWin11BadgeScanPending(HWND hTaskListWnd, LONG lPending)
+{
+    if (!g_bBadgeLockInitialized) return;
+
+    EnterCriticalSection(&g_badgeLock);
+
+    for (int i = 0; i < g_taskbarCount; i++)
+    {
+        if (g_taskbarBadges[i].hTaskListWnd == hTaskListWnd)
+        {
+            InterlockedExchange(&g_taskbarBadges[i].lWin11BadgeScanPending, lPending);
+            break;
+        }
+    }
+
+    LeaveCriticalSection(&g_badgeLock);
+}
+
+static void HideTaskbarBadgeOverlay(HWND hTaskListWnd)
+{
+    TaskbarBadgeData* pData = GetTaskbarBadgeData(hTaskListWnd, FALSE);
+    if (pData && pData->hOverlay && IsWindow(pData->hOverlay))
+    {
+        ShowWindow(pData->hOverlay, SW_HIDE);
+    }
+}
+
+static BOOL Win11Taskbar_ShouldScanBadgeOverlay(HWND hShellTrayWnd)
+{
+    if (!bShowCombinedWindowCount || bOldTaskbar != 0)
+    {
+        HideTaskbarBadgeOverlay(hShellTrayWnd);
+        return FALSE;
+    }
+
+    if (IsForegroundFullScreen(hShellTrayWnd))
+    {
+        HideTaskbarBadgeOverlay(hShellTrayWnd);
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 // Parse window count from button accessibility name
@@ -1656,7 +1719,7 @@ void MSTaskListWClass_UpdateBadgeOverlay(HWND hTaskListWnd)
         wc.hInstance = hModule;
         wc.lpszClassName = MSTASKLISTWCLASS_BADGE_OVERLAY_CLASS;
         wc.hbrBackground = NULL;  // Transparent
-        if (RegisterClassW(&wc))
+        if (RegisterClassW(&wc) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS)
         {
             g_bBadgeClassRegistered = TRUE;
         }
@@ -1931,32 +1994,10 @@ LRESULT CALLBACK MSTaskListWClass_SubclassProc(
 }
 
 // Win11 taskbar badge overlay - uses UI Automation on Shell_TrayWnd to find XAML taskbar buttons
-void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
+static BOOL Win11Taskbar_CollectBadgeOverlay(HWND hShellTrayWnd, Win11BadgeScanResult* pResult)
 {
-    // Get or create per-taskbar data (reuse same infrastructure as Win10)
-    TaskbarBadgeData* pData = GetTaskbarBadgeData(hShellTrayWnd, TRUE);
-    if (!pData) return;
-
-    if (!bShowCombinedWindowCount)
-    {
-        if (pData->hOverlay && IsWindow(pData->hOverlay))
-        {
-            ShowWindow(pData->hOverlay, SW_HIDE);
-        }
-        return;
-    }
-    // Only for Win11 taskbar
-    if (bOldTaskbar != 0) return;
-
-    // Hide badge when a fullscreen window is active
-    if (IsForegroundFullScreen(hShellTrayWnd))
-    {
-        if (pData->hOverlay && IsWindow(pData->hOverlay))
-        {
-            ShowWindow(pData->hOverlay, SW_HIDE);
-        }
-        return;
-    }
+    if (!pResult) return FALSE;
+    pResult->badgeCount = 0;
 
     // Register overlay class if needed
     if (!g_bBadgeClassRegistered)
@@ -1966,7 +2007,7 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
         wc.hInstance = hModule;
         wc.lpszClassName = MSTASKLISTWCLASS_BADGE_OVERLAY_CLASS;
         wc.hbrBackground = NULL;
-        if (RegisterClassW(&wc))
+        if (RegisterClassW(&wc) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS)
         {
             g_bBadgeClassRegistered = TRUE;
         }
@@ -1975,14 +2016,14 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
     // Initialize COM for UI Automation
     HRESULT hrCom = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     BOOL bComInitialized = SUCCEEDED(hrCom) || hrCom == S_FALSE || hrCom == RPC_E_CHANGED_MODE;
-    if (!bComInitialized) return;
+    if (!bComInitialized) return FALSE;
 
     IUIAutomation* pAutomation = NULL;
     HRESULT hr = CoCreateInstance(&CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, &IID_IUIAutomation, (void**)&pAutomation);
     if (FAILED(hr) || !pAutomation)
     {
         if (hrCom == S_OK) CoUninitialize();
-        return;
+        return FALSE;
     }
 
     // Get the Shell_TrayWnd as automation element
@@ -1992,7 +2033,7 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
     {
         pAutomation->lpVtbl->Release(pAutomation);
         if (hrCom == S_OK) CoUninitialize();
-        return;
+        return FALSE;
     }
 
     // For Win11, we need to walk deeper into the XAML tree to find taskbar buttons.
@@ -2005,12 +2046,11 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
         pTrayElement->lpVtbl->Release(pTrayElement);
         pAutomation->lpVtbl->Release(pAutomation);
         if (hrCom == S_OK) CoUninitialize();
-        return;
+        return FALSE;
     }
 
     // Collect badge info
-    pData->badgeCount = 0;
-    RECT rcBounds = { MAXLONG, MAXLONG, MINLONG, MINLONG };
+    pResult->badgeCount = 0;
 
     // Get DPI for calculations
     UINT dpi = 96;
@@ -2054,7 +2094,7 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
         pChild = pNext;
     }
 
-    while (walkDepth > 0 && pData->badgeCount < MAX_BADGES)
+    while (walkDepth > 0 && pResult->badgeCount < MAX_BADGES)
     {
         IUIAutomationElement* pElem = walkStack[--walkDepth];
 
@@ -2088,18 +2128,12 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
                 int badgeWidth = badgeDiameter;
                 int badgeHeight = badgeDiameter;
 
-                pData->badges[pData->badgeCount].rcBadge.left = badgeX;
-                pData->badges[pData->badgeCount].rcBadge.top = badgeY;
-                pData->badges[pData->badgeCount].rcBadge.right = badgeX + badgeWidth;
-                pData->badges[pData->badgeCount].rcBadge.bottom = badgeY + badgeHeight;
-                pData->badges[pData->badgeCount].count = count;
-                pData->badgeCount++;
-
-                // Expand bounds
-                if (badgeX < rcBounds.left) rcBounds.left = badgeX;
-                if (badgeY < rcBounds.top) rcBounds.top = badgeY;
-                if (badgeX + badgeWidth > rcBounds.right) rcBounds.right = badgeX + badgeWidth;
-                if (badgeY + badgeHeight > rcBounds.bottom) rcBounds.bottom = badgeY + badgeHeight;
+                pResult->badges[pResult->badgeCount].rcBadge.left = badgeX;
+                pResult->badges[pResult->badgeCount].rcBadge.top = badgeY;
+                pResult->badges[pResult->badgeCount].rcBadge.right = badgeX + badgeWidth;
+                pResult->badges[pResult->badgeCount].rcBadge.bottom = badgeY + badgeHeight;
+                pResult->badges[pResult->badgeCount].count = count;
+                pResult->badgeCount++;
             }
         }
 
@@ -2146,26 +2180,43 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
     // Deduplicate badges whose screen rects overlap significantly.
     // The recursive UIA tree walk can find the same taskbar button at
     // multiple tree depths, producing duplicate badge entries.
-    for (int i = 0; i < pData->badgeCount; i++)
+    for (int i = 0; i < pResult->badgeCount; i++)
     {
-        for (int j = i + 1; j < pData->badgeCount; )
+        for (int j = i + 1; j < pResult->badgeCount; )
         {
-            if (RectOverlapRatio(&pData->badges[i].rcBadge,
-                                 &pData->badges[j].rcBadge) > 0.5)
+            if (RectOverlapRatio(&pResult->badges[i].rcBadge,
+                                 &pResult->badges[j].rcBadge) > 0.5)
             {
-                // Remove entry j — shift remaining entries left
-                for (int k = j; k < pData->badgeCount - 1; k++)
+                // Remove entry j - shift remaining entries left
+                for (int k = j; k < pResult->badgeCount - 1; k++)
                 {
-                    pData->badges[k] = pData->badges[k + 1];
+                    pResult->badges[k] = pResult->badges[k + 1];
                 }
-                pData->badgeCount--;
-                // Don't increment j — a new element slid into this slot
+                pResult->badgeCount--;
+                // Don't increment j - a new element slid into this slot
             }
             else
             {
                 j++;
             }
         }
+    }
+
+    return TRUE;
+}
+
+static void Win11Taskbar_ApplyBadgeOverlay(HWND hShellTrayWnd, const Win11BadgeScanResult* pResult)
+{
+    if (!pResult || !Win11Taskbar_ShouldScanBadgeOverlay(hShellTrayWnd)) return;
+
+    // Get or create per-taskbar data (reuse same infrastructure as Win10)
+    TaskbarBadgeData* pData = GetTaskbarBadgeData(hShellTrayWnd, TRUE);
+    if (!pData) return;
+
+    pData->badgeCount = min(pResult->badgeCount, MAX_BADGES);
+    if (pData->badgeCount > 0)
+    {
+        memcpy(pData->badges, pResult->badges, sizeof(BadgeInfo) * pData->badgeCount);
     }
 
     // Debounce: reject zero-badge scans that are likely transient UIA failures
@@ -2183,8 +2234,13 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
             if (pData->hOverlay && IsWindow(pData->hOverlay))
             {
                 if (!IsWindowVisible(pData->hOverlay))
+                {
                     ShowWindow(pData->hOverlay, SW_SHOWNOACTIVATE);
-                SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+                if (GetWindow(pData->hOverlay, GW_HWNDPREV) != NULL)
+                {
+                    SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
             }
             return;
         }
@@ -2198,6 +2254,7 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
     }
 
     // Recompute bounds from badge data
+    RECT rcBounds = { MAXLONG, MAXLONG, MINLONG, MINLONG };
     rcBounds.left = MAXLONG; rcBounds.top = MAXLONG;
     rcBounds.right = MINLONG; rcBounds.bottom = MINLONG;
     for (int i = 0; i < pData->badgeCount; i++)
@@ -2215,13 +2272,15 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
     {
         if (pData->badgeCount > 0)
         {
-            // Ensure overlay is visible and topmost even if data hasn't changed.
-            // Task View and other shell transitions can hide the overlay.
+            BOOL bWasHidden = !IsWindowVisible(pData->hOverlay);
             if (!IsWindowVisible(pData->hOverlay))
             {
                 ShowWindow(pData->hOverlay, SW_SHOWNOACTIVATE);
             }
-            SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (bWasHidden || GetWindow(pData->hOverlay, GW_HWNDPREV) != NULL)
+            {
+                SetWindowPos(pData->hOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
         }
         return;
     }
@@ -2274,6 +2333,60 @@ void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
         {
             ShowWindow(pData->hOverlay, SW_HIDE);
         }
+    }
+}
+
+void Win11Taskbar_UpdateBadgeOverlay(HWND hShellTrayWnd)
+{
+    Win11BadgeScanResult result = { 0 };
+    if (Win11Taskbar_ShouldScanBadgeOverlay(hShellTrayWnd) &&
+        Win11Taskbar_CollectBadgeOverlay(hShellTrayWnd, &result))
+    {
+        Win11Taskbar_ApplyBadgeOverlay(hShellTrayWnd, &result);
+    }
+}
+
+DWORD WINAPI Win11Taskbar_BadgeScanThread(LPVOID lpParam)
+{
+    HWND hShellTrayWnd = (HWND)lpParam;
+    Win11BadgeScanResult result = { 0 };
+
+    if (IsWindow(hShellTrayWnd) &&
+        bShowCombinedWindowCount &&
+        bOldTaskbar == 0 &&
+        Win11Taskbar_CollectBadgeOverlay(hShellTrayWnd, &result))
+    {
+        UINT uMsg = GetWin11BadgeScanResultMessage();
+        if (uMsg && IsWindow(hShellTrayWnd))
+        {
+            SendMessageW(hShellTrayWnd, uMsg, 0, (LPARAM)&result);
+        }
+    }
+
+    SetWin11BadgeScanPending(hShellTrayWnd, FALSE);
+    return 0;
+}
+
+static void Win11Taskbar_RequestBadgeOverlayUpdate(HWND hShellTrayWnd)
+{
+    if (!Win11Taskbar_ShouldScanBadgeOverlay(hShellTrayWnd)) return;
+
+    TaskbarBadgeData* pData = GetTaskbarBadgeData(hShellTrayWnd, TRUE);
+    if (!pData) return;
+
+    if (InterlockedCompareExchange(&pData->lWin11BadgeScanPending, TRUE, FALSE) != FALSE)
+    {
+        return;
+    }
+
+    HANDLE hThread = CreateThread(NULL, 0, Win11Taskbar_BadgeScanThread, (LPVOID)hShellTrayWnd, 0, NULL);
+    if (hThread)
+    {
+        CloseHandle(hThread);
+    }
+    else
+    {
+        InterlockedExchange(&pData->lWin11BadgeScanPending, FALSE);
     }
 }
 
@@ -3122,6 +3235,12 @@ INT64 Shell_TrayWndSubclassProc(
     DWORD_PTR   bIsPrimaryTaskbar
 )
 {
+    if (uMsg >= 0xC000 && uMsg <= 0xFFFF && uMsg == GetWin11BadgeScanResultMessage())
+    {
+        Win11Taskbar_ApplyBadgeOverlay(hWnd, (const Win11BadgeScanResult*)lParam);
+        return 0;
+    }
+
     switch (uMsg)
     {
         case WM_NCDESTROY:
@@ -3195,16 +3314,12 @@ INT64 Shell_TrayWndSubclassProc(
             {
                 if (bShowCombinedWindowCount && bOldTaskbar == 0)
                 {
-                    Win11Taskbar_UpdateBadgeOverlay(hWnd);
+                    Win11Taskbar_RequestBadgeOverlayUpdate(hWnd);
                 }
                 else
                 {
                     // Feature disabled or not Win11 taskbar - hide overlay if it exists
-                    TaskbarBadgeData* pData = GetTaskbarBadgeData(hWnd, FALSE);
-                    if (pData && pData->hOverlay && IsWindow(pData->hOverlay))
-                    {
-                        ShowWindow(pData->hOverlay, SW_HIDE);
-                    }
+                    HideTaskbarBadgeOverlay(hWnd);
                 }
                 return 0;
             }
