@@ -1,6 +1,7 @@
 #include "utility.h"
 #include <Wininet.h>
 #pragma comment(lib, "Wininet.lib")
+#include "inc/rtlfeatureconfig.h"
 
 RTL_OSVERSIONINFOW global_rovi;
 DWORD32 global_ubr;
@@ -1587,8 +1588,114 @@ HRESULT SHRegGetBOOLWithREGSAM(HKEY key, LPCWSTR subKey, LPCWSTR value, REGSAM r
 HRESULT SHRegGetDWORD(HKEY hkey, const WCHAR* pwszSubKey, const WCHAR* pwszValue, DWORD* pdwData)
 {
     DWORD dwSize = sizeof(DWORD);
-    LSTATUS lres = RegGetValueW(hkey, pwszSubKey, pwszValue, RRF_RT_REG_DWORD, NULL, pdwData, &dwSize);
-    return HRESULT_FROM_WIN32(lres);
+    LSTATUS lr = RegGetValueW(hkey, pwszSubKey, pwszValue, RRF_RT_REG_DWORD, NULL, pdwData, &dwSize);
+    return HRESULT_FROM_WIN32(lr);
+}
+
+VS_FIXEDFILEINFO* GetModuleVersionInfo(HMODULE hModule, UINT* puPtrLen)
+{
+    void* pFixedFileInfo = NULL;
+    UINT uPtrLen = 0;
+
+    HRSRC hResource = FindResourceW(hModule, MAKEINTRESOURCEW(VS_VERSION_INFO), RT_VERSION);
+    if (hResource)
+    {
+        HGLOBAL hGlobal = LoadResource(hModule, hResource);
+        if (hGlobal)
+        {
+            void* pData = LockResource(hGlobal);
+            if (pData)
+            {
+                if (!VerQueryValueW(pData, L"\\", &pFixedFileInfo, &uPtrLen) || uPtrLen == 0)
+                {
+                    pFixedFileInfo = NULL;
+                    uPtrLen = 0;
+                }
+            }
+        }
+    }
+
+    if (puPtrLen)
+        *puPtrLen = uPtrLen;
+
+    return (VS_FIXEDFILEINFO*)pFixedFileInfo;
+}
+
+RTL_QUERY_FEATURE_CONFIGURATION* g_pfnRtlQueryFeatureConfiguration;
+
+BOOL IsOsFeatureEnabled(UINT featureId, BOOL bEnabledByDefault)
+{
+    BOOL result = bEnabledByDefault;
+
+    HMODULE h = GetModuleHandleW(L"ntdll.dll");
+    g_pfnRtlQueryFeatureConfiguration = (RTL_QUERY_FEATURE_CONFIGURATION*)GetProcAddress(h, "RtlQueryFeatureConfiguration");
+
+    RTL_FEATURE_CONFIGURATION featureConfiguration;
+    RTL_FEATURE_CHANGE_STAMP changeStamp;
+    NTSTATUS status = g_pfnRtlQueryFeatureConfiguration(featureId, RtlFeatureConfigurationRuntime, &changeStamp, &featureConfiguration);
+    if (status == STATUS_SUCCESS)
+    {
+        if (featureConfiguration.EnabledState == FeatureEnabledStateDisabled)
+        {
+            result = FALSE;
+        }
+        else if (featureConfiguration.EnabledState == FeatureEnabledStateEnabled)
+        {
+            result = TRUE;
+        }
+    }
+
+    return result;
+}
+
+BOOL IsRedesignedWin11StartMenu()
+{
+    static int s_bIsRedesignedWin11StartMenu; // UNDEFINED, TRUE, FALSE
+    if (s_bIsRedesignedWin11StartMenu == 0)
+    {
+        s_bIsRedesignedWin11StartMenu = 2;
+
+        if (IsWindows11())
+        {
+            HMODULE hStartDocked = GetModuleHandleW(L"StartDocked.dll");
+
+            BOOL bUnload = FALSE;
+            if (!hStartDocked)
+            {
+                wchar_t szPath[MAX_PATH];
+                GetWindowsDirectoryW(szPath, MAX_PATH);
+                wcscat_s(szPath, MAX_PATH, L"\\SystemApps\\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\\StartDocked.dll");
+                hStartDocked = LoadLibraryExW(szPath, NULL, LOAD_LIBRARY_AS_DATAFILE);
+                bUnload = TRUE;
+            }
+
+            if (hStartDocked)
+            {
+                VS_FIXEDFILEINFO* pFileInfo = GetModuleVersionInfo(hStartDocked, NULL);
+
+                // WORD major = HIWORD(pFileInfo->dwFileVersionMS);
+                // WORD minor = LOWORD(pFileInfo->dwFileVersionMS);
+                WORD build = HIWORD(pFileInfo->dwFileVersionLS);
+                WORD ubr = LOWORD(pFileInfo->dwFileVersionLS);
+
+                if ((build == 22621 && ubr >= 3420)
+                   || (build == 26100 && ubr >= 1350)
+                   || (build >= 26241 && build < 27547)
+                   || build >= 27695)
+                {
+                    s_bIsRedesignedWin11StartMenu = IsOsFeatureEnabled(47205210, TRUE)
+                        && IsOsFeatureEnabled(49221331, TRUE)
+                        && IsOsFeatureEnabled(49402389, TRUE) ? 1 : 2;
+                }
+
+                if (bUnload)
+                {
+                    FreeLibrary(hStartDocked);
+                }
+            }
+        }
+    }
+    return s_bIsRedesignedWin11StartMenu == 1;
 }
 
 #ifdef WITH_MAIN_PATCHER

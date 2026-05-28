@@ -5,8 +5,6 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <Windows.h>
-#include <Psapi.h>
-#pragma comment(lib, "Psapi.lib") // required by funchook
 #include <Shlwapi.h>
 #pragma comment(lib, "Shlwapi.lib")
 #include <windowsx.h>
@@ -625,7 +623,7 @@ void LaunchNetworkTargets(DWORD dwTarget)
     }
     else if (dwTarget == 2)
     {
-        HMODULE hVan = LoadLibraryW(L"van.dll");
+        HMODULE hVan = LoadLibraryExW(L"van.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (hVan)
         {
             long(*ShowVAN)(BOOL, BOOL, void*) = GetProcAddress(hVan, "ShowVAN");
@@ -1114,11 +1112,11 @@ typedef struct ITaskBtnGroupVtbl
 
     int(STDMETHODCALLTYPE* GetIdealSpan)(
         ITaskBtnGroup* This,
-        int var2,
-        int var3,
-        int var4,
-        int var5,
-        int var6);
+        int rowColBegin,
+        int rowColEnd,
+        BOOL bUseGlomState,
+        BOOL bUseGlomAnim,
+        int* pcxShrinkable);
     // ...
 
     END_INTERFACE
@@ -1131,28 +1129,32 @@ interface ITaskBtnGroup
 
 typedef enum eTBGROUPTYPE
 {
-    TBGROUPTYPE_Unknown,
-    TBGROUPTYPE_Normal,
-    TBGROUPTYPE_Pinned,
-    TBGROUPTYPE_Stacked,
-    TBGROUPTYPE_Invisible,
+    TBG_UNKNOWN,
+    TBG_SWITCHER,
+    TBG_LAUNCHER,
+    TBG_GLOM,
+    TBG_GHOST,
 } TBGROUPTYPE;
 
-int (STDMETHODCALLTYPE *CTaskBtnGroup_GetIdealSpanFunc)(ITaskBtnGroup* pTaskBtnGroup, int var2, int var3,
-    int var4, int var5, int* var6) = NULL;
-int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(ITaskBtnGroup* pTaskBtnGroup, int var2, int var3,
-    int var4, int var5, int* var6)
+// int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim, int* pcxShrinkable
+int (STDMETHODCALLTYPE *CTaskBtnGroup_GetIdealSpanFunc)(
+    ITaskBtnGroup* pTaskBtnGroup, int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim,
+    int* pcxShrinkable) = NULL;
+int STDMETHODCALLTYPE CTaskBtnGroup_GetIdealSpanHook(
+    ITaskBtnGroup* pTaskBtnGroup, int rowColBegin, int rowColEnd, BOOL bUseGlomState, BOOL bUseGlomAnim,
+    int* pcxShrinkable)
 {
     BOOL bTypeModified = FALSE;
     PBYTE _this = (PBYTE)pTaskBtnGroup - 16 /*sizeof(CTaskUnknown)*/;
     TBGROUPTYPE* pGroupType = (TBGROUPTYPE*)(_this + 80 /*offsetof(CTaskBtnGroup, m_groupType)*/);
     TBGROUPTYPE lastGroupType = *pGroupType;
-    if (bRemoveExtraGapAroundPinnedItems && lastGroupType == TBGROUPTYPE_Pinned)
+    if (bRemoveExtraGapAroundPinnedItems && lastGroupType == TBG_LAUNCHER)
     {
-        *pGroupType = TBGROUPTYPE_Invisible;
+        *pGroupType = TBG_GHOST;
         bTypeModified = TRUE;
     }
-    int ret = CTaskBtnGroup_GetIdealSpanFunc(pTaskBtnGroup, var2, var3, var4, var5, var6);
+    int ret = CTaskBtnGroup_GetIdealSpanFunc(
+        pTaskBtnGroup, rowColBegin, rowColEnd, bUseGlomState, bUseGlomAnim, pcxShrinkable);
     if (bRemoveExtraGapAroundPinnedItems && bTypeModified)
     {
         *pGroupType = lastGroupType;
@@ -2623,8 +2625,12 @@ DWORD FixTaskbarAutohide(DWORD unused)
 #if WITH_MAIN_PATCHER
 void ForceEnableXamlSounds(HMODULE hWindowsUIXaml)
 {
-    MODULEINFO mi;
-    if (!hWindowsUIXaml || !GetModuleInformation(GetCurrentProcess(), hWindowsUIXaml, &mi, sizeof(MODULEINFO)))
+    if (!hWindowsUIXaml)
+        return;
+
+    PBYTE pWindowsUIXamlText;
+    DWORD cbWindowsUIXamlText;
+    if (!TextSectionBeginAndSize(hWindowsUIXaml, &pWindowsUIXamlText, &cbWindowsUIXamlText))
         return;
 
     // Patch DirectUI::ElementSoundPlayerService::ShouldPlaySound() to disregard XboxUtility::IsOnXbox() check
@@ -2633,39 +2639,58 @@ void ForceEnableXamlSounds(HMODULE hWindowsUIXaml)
     // 74 ?? 39 59 ?? 75 ?? E8 ?? ?? ?? ?? 84 C0 75
     //                                           ^^ change jnz to jmp
     PBYTE match = FindPattern(
-        mi.lpBaseOfDll,
-        mi.SizeOfImage,
+        pWindowsUIXamlText,
+        cbWindowsUIXamlText,
         "\x74\x00\x39\x59\x00\x75\x00\xE8\x00\x00\x00\x00\x84\xC0\x75",
         "x?xx?x?x????xxx"
     );
     if (match)
     {
-        PBYTE jnz = match + 14;
-        DWORD flOldProtect = 0;
-        if (VirtualProtect(jnz, 1, PAGE_EXECUTE_READWRITE, &flOldProtect))
+        match += 14; // Point to jnz
+    }
+    else
+    {
+        // 29553+
+        // 83 79 ?? 02 74 ?? 83 79 ?? 00 75 ?? E8 ?? ?? ?? ?? 84 C0 75
+        //                                                          ^^ change jnz to jmp
+        match = FindPattern(
+            pWindowsUIXamlText,
+            cbWindowsUIXamlText,
+            "\x83\x79\x00\x02\x74\x00\x83\x79\x00\x00\x75\x00\xE8\x00\x00\x00\x00\x84\xC0\x75",
+            "xx?xx?xx?xx?x????xxx"
+        );
+        if (match)
         {
-            *jnz = 0xEB;
-            VirtualProtect(jnz, 1, flOldProtect, &flOldProtect);
+            match += 19; // Point to jnz
+        }
+    }
+    if (match)
+    {
+        DWORD flOldProtect = 0;
+        if (VirtualProtect(match, 1, PAGE_EXECUTE_READWRITE, &flOldProtect))
+        {
+            *match = 0xEB;
+            VirtualProtect(match, 1, flOldProtect, &flOldProtect);
         }
     }
 #elif defined(_M_ARM64)
-    // 1F 09 00 71 ?? ?? ?? 54 ?? 00 00 35 ?? ?? ?? ?? 08 1C 00 53 ?? ?? ?? ??
-    //                                                             ^^^^^^^^^^^ CBNZ -> B, CBZ -> NOP
-    PBYTE match = FindPattern(
-        mi.lpBaseOfDll,
-        mi.SizeOfImage,
-        "\x1F\x09\x00\x71\x00\x00\x00\x54\x00\x00\x00\x35\x00\x00\x00\x00\x08\x1C\x00\x53",
-        "xxxx???x?xxx????xxxx"
+    // 08 ?? ?? B9 1F 09 00 71 ?? ?? ?? 54 ?? 00 00 35 ?? ?? ?? ??
+    //                                                 ^^^^^^^^^^^ BL -> MOV W0, #1
+    // BL:
+    // P: 0b100101_00000000000000000000000000 = 94000000 = 00 00 00 94
+    // M: 0b111111_00000000000000000000000000 = FC000000 = 00 00 00 FC
+    PBYTE match = FindPatternBitMask_4_(
+        pWindowsUIXamlText,
+        cbWindowsUIXamlText,
+        "\x08\x00\x00\xB9\x1F\x09\x00\x71\x00\x00\x00\x54\x00\x00\x00\x35\x00\x00\x00\x94",
+        "\xFF\x00\x00\xFF\xFF\xFF\xFF\xFF\x00\x00\x00\xFF\x00\xFF\xFF\xFF\x00\x00\x00\xFC",
+        20
     );
     if (match)
     {
-        match += 20;
-        DWORD currentInsn = *(DWORD*)match;
-        DWORD newInsn = ARM64_CBNZWToB(currentInsn);
-        if (!newInsn && ARM64_IsCBZW(currentInsn))
-        {
-            newInsn = 0xD503201F; // NOP
-        }
+        match += 16;
+        // DWORD currentInsn = *(DWORD*)match;
+        DWORD newInsn = /*ARM64_IsBL(currentInsn) ?*/ 0x52800020 /*: 0*/; // MOV W0, #1
         if (newInsn)
         {
             DWORD flOldProtect = 0;
@@ -2832,13 +2857,8 @@ HMODULE __fastcall Windows11v22H2_combase_LoadLibraryExW(LPCWSTR lpLibFileName, 
             pWindowsXamlManagerFactory->lpVtbl->QueryInterface(pWindowsXamlManagerFactory, &uuidof_Windows_UI_Core_ICoreWindow5, &pCoreWindow5);
             if (pCoreWindow5)
             {
-                INT64* pCoreWindow5Vtbl = pCoreWindow5->lpVtbl;
-                if (VirtualProtect(pCoreWindow5->lpVtbl, sizeof(IInspectableVtbl) + sizeof(INT64), PAGE_EXECUTE_READWRITE, &flOldProtect))
-                {
-                    ICoreWindow5_get_DispatcherQueueFunc = pCoreWindow5Vtbl[6];
-                    pCoreWindow5Vtbl[6] = ICoreWindow5_get_DispatcherQueueHook;
-                    VirtualProtect(pCoreWindow5->lpVtbl, sizeof(IInspectableVtbl) + sizeof(INT64), flOldProtect, &flOldProtect);
-                }
+                void** pCoreWindow5Vtbl = *(void***)pCoreWindow5;
+                REPLACE_VTABLE_ENTRY(pCoreWindow5Vtbl, 6, ICoreWindow5_get_DispatcherQueue);
                 pCoreWindow5->lpVtbl->Release(pCoreWindow5);
             }
             pWindowsXamlManagerFactory->lpVtbl->Release(pWindowsXamlManagerFactory);
@@ -3381,6 +3401,14 @@ INT64 Shell_TrayWndSubclassProc(
             }
             break;
         }
+        case 0x5C3: // Stuck place / monitor change
+        {
+            if (bIsPrimaryTaskbar)
+            {
+                UpdateStartMenuPositioning(MAKELPARAM(TRUE, FALSE));
+            }
+            break;
+        }
     }
 
     if (uMsg >= 0xC000 && uMsg <= 0xFFFF && uMsg == RegisterWindowMessageW(L"Windows11ContextMenu_" _T(EP_CLSID)))
@@ -3815,22 +3843,25 @@ static void HookImmersiveMenuFunctions(
     ImmersiveContextMenuHelper_ApplyOwnerDrawToMenu_t* applyFunc,
     ImmersiveContextMenuHelper_ApplyOwnerDrawToMenu_t applyHook)
 {
-    MODULEINFO mi;
-    GetModuleInformation(GetCurrentProcess(), module, &mi, sizeof(MODULEINFO));
+    PBYTE pText;
+    DWORD cbText;
+    if (!TextSectionBeginAndSize(module, &pText, &cbText))
+        return;
 
+    // Don't forget to sync with TryToFindTwinuiPCShellOffsets in TwinUIPatches.cpp!
 #if defined(_M_X64)
     // 40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ? ? ? ? 48 81 EC ? ? ? ? 48 8B 05 ? ? ? ? 48 33 C4 48 89 85 ? ? ? ? 4C 8B ? ? ? ? ? 41 8B C1
     PBYTE match = (PBYTE)FindPattern(
-        mi.lpBaseOfDll, mi.SizeOfImage,
+        pText, cbText,
         "\x40\x55\x53\x56\x57\x41\x54\x41\x55\x41\x56\x41\x57\x48\x8D\xAC\x24\x00\x00\x00\x00\x48\x81\xEC\x00\x00\x00\x00\x48\x8B\x05\x00\x00\x00\x00\x48\x33\xC4\x48\x89\x85\x00\x00\x00\x00\x4C\x8B\x00\x00\x00\x00\x00\x41\x8B\xC1",
         "xxxxxxxxxxxxxxxxx????xxx????xxx????xxxxxx????xx?????xxx"
     );
 #elif defined(_M_ARM64)
-    // 40 F9 43 03 1C 32 E4 03 ?? AA ?? ?? FF 97
-    //                               ^^^^^^^^^^^
+    // ?? ?? 40 F9 43 03 1C 32 E4 03 ?? AA ?? ?? FF 97
+    //                                     ^^^^^^^^^^^
     // Ref: ImmersiveContextMenuHelper::ApplyOwnerDrawToMenu()
-    PBYTE match = (PBYTE)FindPattern(
-        mi.lpBaseOfDll, mi.SizeOfImage,
+    PBYTE match = (PBYTE)FindPattern_4_(
+        pText + 2, cbText - 2,
         "\x40\xF9\x43\x03\x1C\x32\xE4\x03\x00\xAA\x00\x00\xFF\x97",
         "xxxxxxxx?x??xx"
     );
@@ -3838,6 +3869,22 @@ static void HookImmersiveMenuFunctions(
     {
         match += 10;
         match = (PBYTE)ARM64_FollowBL((DWORD*)match);
+    }
+    else
+    {
+        // 43 03 1C 32 E4 03 ?? AA E2 03 ?? AA ?? ?? FF 97 // 27938
+        //                                     ^^^^^^^^^^^
+        // Ref: ImmersiveContextMenuHelper::ApplyOwnerDrawToMenu()
+        match = (PBYTE)FindPattern_4_(
+            pText, cbText,
+            "\x43\x03\x1C\x32\xE4\x03\x00\xAA\xE2\x03\x00\xAA\x00\x00\xFF\x97",
+            "xxxxxx?xxx?x??xx"
+        );
+        if (match)
+        {
+            match += 12;
+            match = (PBYTE)ARM64_FollowBL((DWORD*)match);
+        }
     }
 #endif
     if (match)
@@ -4353,7 +4400,7 @@ BOOL sndvolsso_TrackPopupMenuExHook(
 }
 void PatchSndvolsso()
 {
-    HANDLE hSndvolsso = LoadLibraryW(L"sndvolsso.dll");
+    HANDLE hSndvolsso = LoadLibraryExW(L"sndvolsso.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     VnPatchIAT(hSndvolsso, "user32.dll", "TrackPopupMenuEx", sndvolsso_TrackPopupMenuExHook);
 
     // Create a local funchook because we can get called after the global one is installed
@@ -4874,7 +4921,7 @@ HWND WINAPI explorerframe_SHCreateWorkerWindowHook(
             // If we don't do this, it will only fix itself once the user changes the system color scheme or toggling transparency effects
             if (!ShouldAppsUseDarkMode)
             {
-                HANDLE hUxtheme = LoadLibraryW(L"uxtheme.dll");
+                HANDLE hUxtheme = LoadLibraryExW(L"uxtheme.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
                 ShouldAppsUseDarkMode = GetProcAddress(hUxtheme, (LPCSTR)0x84);
             }
             if (ShouldAppsUseDarkMode)
@@ -9577,15 +9624,18 @@ HACCEL WINAPI ExplorerFrame_LoadAcceleratorsW(HINSTANCE hInstance, LPCWSTR lpTab
  * - Fixes menu bar behavior on Windows 7 Command Bar
  * - Fixes window position and size not being saved on Windows 8/10 Ribbon
  */
-void FixTIFEBreakagesForLegacyControlInterfaces(const MODULEINFO* pmi)
+void FixTIFEBreakagesForLegacyControlInterfaces(PBYTE pSearchBegin, size_t cbSearch)
 {
+    if (!pSearchBegin || !cbSearch)
+        return;
+
 #if defined(_M_X64)
     // No TIFE feature flag
     // 8B 8B ?? ?? 00 00 8B 83 ?? ?? 00 00 89 8B ?? ?? 00 00 89 83 ?? ?? 00 00 F6 C1 10 <jz/jnz>
     // Ref: CInternetToolbar::_CreateBands()
     PBYTE match = FindPattern(
-        pmi->lpBaseOfDll,
-        pmi->SizeOfImage,
+        pSearchBegin,
+        cbSearch,
         "\x8B\x8B\x00\x00\x00\x00\x8B\x83\x00\x00\x00\x00\x89\x8B\x00\x00\x00\x00\x89\x83\x00\x00\x00\x00\xF6\xC1\x10",
         "xx??xxxx??xxxx??xxxx??xxxxx"
     );
@@ -9599,8 +9649,8 @@ void FixTIFEBreakagesForLegacyControlInterfaces(const MODULEINFO* pmi)
         // 8B 83 ?? ?? 00 00 A8 10 <jz>
         // Ref: CInternetToolbar::_CreateBands()
         match = FindPattern(
-            pmi->lpBaseOfDll,
-            pmi->SizeOfImage,
+            pSearchBegin,
+            cbSearch,
             "\x8B\x83\x00\x00\x00\x00\xA8\x10",
             "xx??xxxx"
         );
@@ -9653,9 +9703,9 @@ void FixTIFEBreakagesForLegacyControlInterfaces(const MODULEINFO* pmi)
     // No TIFE feature flag
     // 69 ?? ?? B9 68 ?? ?? B9 69 ?? ?? 29 <TBZ/TBNZ>
     // Ref: CInternetToolbar::_CreateBands()
-    PBYTE match = FindPattern(
-        pmi->lpBaseOfDll,
-        pmi->SizeOfImage,
+    PBYTE match = FindPattern_4_(
+        pSearchBegin,
+        cbSearch,
         "\x69\x00\x00\xB9\x68\x00\x00\xB9\x69\x00\x00\x29",
         "x??xx??xx??x"
     );
@@ -9669,9 +9719,9 @@ void FixTIFEBreakagesForLegacyControlInterfaces(const MODULEINFO* pmi)
         // 68 ?? ?? B9 68 00 20 36 08 79 1B 12 68 ?? ?? B9
         //             ^^^^^^^^^^^ <TBZ>
         // Ref: CInternetToolbar::_CreateBands()
-        match = FindPattern(
-            pmi->lpBaseOfDll,
-            pmi->SizeOfImage,
+        match = FindPattern_4_(
+            pSearchBegin,
+            cbSearch,
             "\x68\x00\x00\xB9\x68\x00\x20\x36\x08\x79\x1B\x12\x68\x00\x00\xB9",
             "x??xxxxxxxxxx??x"
         );
@@ -9903,7 +9953,6 @@ LSTATUS explorer_RegGetValueW(
     LPDWORD pcbData
 )
 {
-    DWORD flOldProtect;
     BOOL bShowTaskViewButton = FALSE;
     LSTATUS lRes;
 
@@ -10344,8 +10393,11 @@ int explorerframe_GetSystemMetricsForDpi(int nIndex, UINT dpi)
     return GetSystemMetricsForDpi(nIndex, dpi);
 }
 
-static void PatchAddressBarSizing(const MODULEINFO* mi)
+static void PatchAddressBarSizing(PBYTE pSearchBegin, size_t cbSearch)
 {
+    if (!pSearchBegin || !cbSearch)
+        return;
+
     // <- means inlined
 
     PBYTE match;
@@ -10359,8 +10411,8 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
         // 83 45 ?? ?? 83 6D ?? ?? 48
         //          xx To 03    xx To 01
         match = FindPattern(
-            mi->lpBaseOfDll,
-            mi->SizeOfImage,
+            pSearchBegin,
+            cbSearch,
             "\x83\x45\x00\x00\x83\x6D\x00\x00\x48",
             "xx??xx??x"
         );
@@ -10375,8 +10427,8 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
         // 83 45 ?? ?? 83 6D ?? ?? 0F
         //          xx To 03    xx To 01
         match = FindPattern(
-            mi->lpBaseOfDll,
-            mi->SizeOfImage,
+            pSearchBegin,
+            cbSearch,
             "\x83\x45\x00\x00\x83\x6D\x00\x00\x0F",
             "xx??xx??x"
         );
@@ -10395,8 +10447,8 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
             // 0F 1F 44 00 00 83 43 04 ?? 83 43 0C ??
             //                         xx To 03    xx To FF (-1)
             match = FindPattern(
-                mi->lpBaseOfDll,
-                mi->SizeOfImage,
+                pSearchBegin,
+                cbSearch,
                 "\x0F\x1F\x44\x00\x00\x83\x43\x04\x00\x83\x43\x0C",
                 "xxxxxxxx?xxx"
             );
@@ -10415,8 +10467,8 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
         // 83 45 ?? ?? 48 8D 0D ?? ?? ?? ?? 45 33 C0 B2 01 E8 ?? ?? ?? ?? 83 6D ?? ?? 48
         //          xx To 03                                                       xx To 01
         match = FindPattern(
-            mi->lpBaseOfDll,
-            mi->SizeOfImage,
+            pSearchBegin,
+            cbSearch,
             "\x83\x45\x00\x00\x48\x8D\x0D\x00\x00\x00\x00\x45\x33\xC0\xB2\x01\xE8\x00\x00\x00\x00\x83\x6D\x00\x00\x48",
             "xx??xxx????xxxxxx????xx??x"
         );
@@ -10430,8 +10482,8 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
         // 83 45 ?? ?? 45 33 C0 B2 01 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 83 6D ?? ?? 0F
         //          xx To 03                                                       xx To 01
         match = FindPattern(
-            mi->lpBaseOfDll,
-            mi->SizeOfImage,
+            pSearchBegin,
+            cbSearch,
             "\x83\x45\x00\x00\x45\x33\xC0\xB2\x01\x48\x8D\x0D\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x83\x6D\x00\x00\x0F",
             "xx??xxxxxxxx????x????xx??x"
         );
@@ -10448,8 +10500,8 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
     // 41 8D 48 AA 48 FF 15 ?? ?? ?? ?? 0F 1F 44 00 ?? 03 F8 // 22621.2506/2715
     //          xx To 9E
     /*match = FindPattern(
-        mi->lpBaseOfDll,
-        mi->SizeOfImage,
+        pSearchBegin,
+        cbSearch,
         "\x41\x8D\x48\xAA\x48\xFF\x15\x00\x00\x00\x00\x0F\x1F\x44\x00\x00\x03\xF8",
         "xxxxxxx????xxxx?xx"
     );
@@ -10467,8 +10519,8 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
     // 41 8D 48 AA 48 FF 15 ?? ?? ?? ?? 0F 1F 44 00 ?? 48 8B // 22621.2506/2715
     //          xx To 9E
     match = FindPattern(
-        mi->lpBaseOfDll,
-        mi->SizeOfImage,
+        pSearchBegin,
+        cbSearch,
         "\x41\x8D\x48\xAA\x48\xFF\x15\x00\x00\x00\x00\x0F\x1F\x44\x00\x00\x03\xF8",
         "xxxxxxx????xxxx?xx"
     );
@@ -10479,52 +10531,68 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
     }*/
 
     // Patch address band height
-    // CAddressBand::GetBandInfo() <- CAddressBand::GetBandHeight()
-    // 83 C7 10 45 85 ED 4C 8B 6C 24 // 22621.2506/2715
-    // 83 C7 07 45 85 E4 4C 8B A4 24 // 19045.3393
-    // 83 C7 ?? 45 85 ?? 4C 8B ?? 24
-    //       xx To 04
-    match = FindPattern(
-        mi->lpBaseOfDll,
-        mi->SizeOfImage,
-        "\x83\xC7\x00\x45\x85\x00\x4C\x8B\x00\x24",
-        "xx?xx?xx?x"
-    );
+    match = NULL;
+    if (!match)
+    {
+        // CAddressBand::GetBandHeight()
+        // 8D 43 ?? 48 8B 4C 24 ?? 48 33 CC E8 // 25951
+        //       xx To 04
+        match = FindPattern(
+            pSearchBegin,
+            cbSearch,
+            "\x8D\x43\x00\x48\x8B\x4C\x24\x00\x48\x33\xCC\xE8",
+            "xx?xxxx?xxxx"
+        );
+    }
+    if (!match)
+    {
+        // CAddressBand::GetBandInfo() <- CAddressBand::GetBandHeight()
+        // 83 C7 ?? 83 7C 24 ?? ?? 0F 85 // 23560.1000
+        //       xx To 04          ^^^^^ long jnz
+        match = FindPattern(
+            pSearchBegin,
+            cbSearch,
+            "\x83\xC7\x00\x83\x7C\x24\x00\x00\x0F\x85",
+            "xx?xxx??xx"
+        );
+    }
+    if (!match)
+    {
+        // CAddressBand::GetBandInfo() <- CAddressBand::GetBandHeight()
+        // 83 C7 10 45 85 ED 4C 8B 6C 24 // 22621.2506/2715
+        // 83 C7 07 45 85 E4 4C 8B A4 24 // 19045.3393
+        // 83 C7 ?? 45 85 ?? 4C 8B ?? 24
+        //       xx To 04
+        match = FindPattern(
+            pSearchBegin,
+            cbSearch,
+            "\x83\xC7\x00\x45\x85\x00\x4C\x8B\x00\x24",
+            "xx?xx?xx?x"
+        );
+    }
     if (!match)
     {
         // CAddressBand::GetBandInfo() <- CAddressBand::GetBandHeight()
         // 83 C7 ?? 83 7C 24 ?? ?? 74 // 22621.1992
         //       xx To 04          ^^ short jnz
         match = FindPattern(
-            mi->lpBaseOfDll,
-            mi->SizeOfImage,
+            pSearchBegin,
+            cbSearch,
             "\x83\xC7\x00\x83\x7C\x24\x00\x00\x74",
             "xx?xxx??x"
         );
-        if (!match)
-        {
-            // CAddressBand::GetBandInfo() <- CAddressBand::GetBandHeight()
-            // 83 C7 ?? 83 7C 24 ?? ?? 0F 85 // 23560.1000
-            //       xx To 04          ^^^^^ long jnz
-            match = FindPattern(
-                mi->lpBaseOfDll,
-                mi->SizeOfImage,
-                "\x83\xC7\x00\x83\x7C\x24\x00\x00\x0F\x85",
-                "xx?xxx??xx"
-            );
-            if (!match)
-            {
-                // CAddressBand::GetBandHeight()
-                // 8D 43 ?? 48 8B 4C 24 ?? 48 33 CC E8 // 25951
-                //       xx To 04
-                match = FindPattern(
-                    mi->lpBaseOfDll,
-                    mi->SizeOfImage,
-                    "\x8D\x43\x00\x48\x8B\x4C\x24\x00\x48\x33\xCC\xE8",
-                    "xx?xxxx?xxxx"
-                );
-            }
-        }
+    }
+    if (!match)
+    {
+        // CAddressBand::GetBandInfo() <- CAddressBand::GetBandHeight()
+        // 83 C7 xx 45 33 F6 44 39 74 24 // 22621.317
+        //       xx To 04
+        match = FindPattern(
+            pSearchBegin,
+            cbSearch,
+            "\x83\xC7\x00\x45\x33\xF6\x44\x39\x74\x24",
+            "xx?xxxxxxx"
+        );
     }
     if (match)
     {
@@ -10540,8 +10608,8 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
     // 8D 4D AA 44 8B C5 48 FF 15
     //       xx To 9E
     match = FindPattern(
-        mi->lpBaseOfDll,
-        mi->SizeOfImage,
+        pSearchBegin,
+        cbSearch,
         "\x8D\x4D\xAA\x44\x8B\xC5\x48\xFF\x15",
         "xxxxxxxxx"
     );
@@ -10558,8 +10626,8 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
         // B9 0A 00 00 00 48 FF 15 // Windows 10 and Windows 11 25951
         //    xxxxxxxxxxx To 0
         match = FindPattern(
-            mi->lpBaseOfDll,
-            mi->SizeOfImage,
+            pSearchBegin,
+            cbSearch,
             "\xB9\x0A\x00\x00\x00\x48\xFF\x15",
             "xxxxxxxx"
         );
@@ -10580,8 +10648,8 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
         //                            xx To A8
 #if defined(_M_X64)
         match = FindPattern(
-            mi->lpBaseOfDll,
-            mi->SizeOfImage,
+            pSearchBegin,
+            cbSearch,
             "\x41\xB8\x60\x00\x00\x00\x41\x8D\x58\xB1",
             "xxxxxxxxxx"
         );
@@ -10599,8 +10667,8 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
             // 48 8B F1 48 8B 49 70 ?? ?? ?? ?? B8 ?? ?? ?? ?? // 23590, 25951
             //                                     xxxxxxxxxxx To 8
             match = FindPattern(
-                mi->lpBaseOfDll,
-                mi->SizeOfImage,
+                pSearchBegin,
+                cbSearch,
                 "\x48\x8B\xF1\x48\x8B\x49\x70\x00\x00\x00\x00\xB8",
                 "xxxxxxx????x"
             );
@@ -10620,15 +10688,14 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
         // BA 04 00 00 00 0F 95 C0 84 C0 75 02 8B D6
         //    xxxxxxxxxxx To 01 00 00 00
         match = FindPattern(
-            mi->lpBaseOfDll,
-            mi->SizeOfImage,
+            pSearchBegin,
+            cbSearch,
             "\xBA\x04\x00\x00\x00\x0F\x95\xC0\x84\xC0\x75\x02\x8B\xD6",
             "xxxxxxxxxxxxxx"
         );
-        if (match && VirtualProtect(match, 5, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+        if (match)
         {
-            *(int*)(match + 1) = 1;
-            VirtualProtect(match, 5, dwOldProtect, &dwOldProtect);
+            match += 1; // Point to 04 00 00 00
         }
         else
         {
@@ -10637,37 +10704,55 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
             // C7 44 24 ?? 04 00 00 00 84 C0 75 08 C7 44 24 ?? 01 00 00 00
             //             xxxxxxxxxxx To 01 00 00 00
             match = FindPattern(
-                mi->lpBaseOfDll,
-                mi->SizeOfImage,
+                pSearchBegin,
+                cbSearch,
                 "\xC7\x44\x24\x00\x04\x00\x00\x00\x84\xC0\x75\x08\xC7\x44\x24\x00\x01\x00\x00\x00",
                 "xxx?xxxxxxxxxxx?xxxx"
             );
-            if (match && VirtualProtect(match, 8, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+            if (match)
             {
-                *(int*)(match + 4) = 1;
-                VirtualProtect(match, 8, dwOldProtect, &dwOldProtect);
+                match += 4; // Point to 04 00 00 00
+            }
+            else
+            {
+                // Feature flag always enabled & removed, Germanium 26100.7262+ & Bromine 28000.1362+ (NB: Nickel never got this treatment)
+                // CAddressBand::ResizeToolbarButtons()
+                // 8B 7B 0C 2B 7B 04 48 8B 4E 48 48 8D 54 24 ?? 45 33 C0 C7 44 24 ?? 04 00 00 00 E8
+                //                                                                   xxxxxxxxxxx To 01 00 00 00
+                match = FindPattern(
+                    pSearchBegin,
+                    cbSearch,
+                    "\x8B\x7B\x0C\x2B\x7B\x04\x48\x8B\x4E\x48\x48\x8D\x54\x24\x00\x45\x33\xC0\xC7\x44\x24\x00\x04\x00\x00\x00\xE8",
+                    "xxxxxxxxxxxxxx?xxxxxx?xxxxx"
+                );
+                if (match)
+                {
+                    match += 22; // Point to 04 00 00 00
+                }
             }
         }
-        // TODO Revisit once forced-on
+        if (match && VirtualProtect(match, 4, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+        {
+            *(int*)match = 1;
+            VirtualProtect(match, 4, dwOldProtect, &dwOldProtect);
+        }
 #elif defined(_M_ARM64)
+        DWORD insnNew = 0;
         // Feature flag present, target register W1 (Nickel)
         // CAddressBand::ResizeToolbarButtons()
         // CAddressBand::_PositionChildWindows() <- CAddressBand::ResizeToolbarButtons()
         // 81 00 80 52 02 00 00 14 21 00 80 52
         // xxxxxxxxxxx To 21 00 80 52
-        match = FindPattern(
-            mi->lpBaseOfDll,
-            mi->SizeOfImage,
+        match = FindPattern_4_(
+            pSearchBegin,
+            cbSearch,
             "\x81\x00\x80\x52\x02\x00\x00\x14\x21\x00\x80\x52",
             "xxxxxxxxxxxx"
         );
         if (match)
         {
-            if (VirtualProtect(match, 4, PAGE_EXECUTE_READWRITE, &dwOldProtect))
-            {
-                *(DWORD*)(match + 0) = 0x52800021; // MOV W1, #1
-                VirtualProtect(match, 4, dwOldProtect, &dwOldProtect);
-            }
+            match += 0; // Point to 81 00 80 52
+            insnNew = 0x52800021; // MOV W1, #1
         }
         else
         {
@@ -10675,19 +10760,60 @@ static void PatchAddressBarSizing(const MODULEINFO* mi)
             // CAddressBand::ResizeToolbarButtons()
             // 88 00 80 52 02 00 00 14 28 00 80 52
             // xxxxxxxxxxx To 28 00 80 52
-            match = FindPattern(
-                mi->lpBaseOfDll,
-                mi->SizeOfImage,
+            match = FindPattern_4_(
+                pSearchBegin,
+                cbSearch,
                 "\x88\x00\x80\x52\x02\x00\x00\x14\x28\x00\x80\x52",
                 "xxxxxxxxxxxx"
             );
-            if (match && VirtualProtect(match, 4, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+            if (match)
             {
-                *(DWORD*)(match + 0) = 0x52800028; // MOV W8, #1
-                VirtualProtect(match, 4, dwOldProtect, &dwOldProtect);
+                match += 0; // Point to 88 00 80 52
+                insnNew = 0x52800028; // MOV W8, #1
+            }
+            else
+            {
+                // Feature flag always enabled & removed, Germanium 26100.7262+ & Bromine 28000.1362+ (NB: Nickel never got this treatment)
+                // CAddressBand::ResizeToolbarButtons()
+                // SHLogicalToPhysicalDPI non-inlined (GE ARM64 & ARM64EC; BR ARM64EC)
+                // ?? 01 08 4B ?? ?? ?? ?? 88 00 80 52 02 00 80 D2 ?? 13 00 B9 ?? 43 00 91 ?? ?? ?? ?? ?? 13 40 B9
+                //                         xxxxxxxxxxx To 28 00 80 52
+                match = FindPattern_4_(
+                    pSearchBegin + 1,
+                    cbSearch - 1,
+                    "\x01\x08\x4B\x00\x00\x00\x00\x88\x00\x80\x52\x02\x00\x80\xD2\x00\x13\x00\xB9\x00\x43\x00\x91\x00\x00\x00\x00\x00\x13\x40\xB9",
+                    "xxx????xxxxxxxx?xxx?xxx?????xxx"
+                );
+                if (match)
+                {
+                    match += 7; // Point to 88 00 80 52
+                    insnNew = 0x52800028; // MOV W8, #1
+                }
+                else
+                {
+                    // SHLogicalToPhysicalDPI inlined (BR ARM64)
+                    // Constant "4" passed directly to 1st arg of MulDiv (W0)
+                    // 02 0C 80 52 E1 03 ?? 2A 80 00 80 52 ?? ?? ?? ?? ?? ?? ?? 4B
+                    //                         xxxxxxxxxxx To 20 00 80 52
+                    match = FindPattern_4_(
+                        pSearchBegin,
+                        cbSearch,
+                        "\x02\x0C\x80\x52\xE1\x03\x00\x2A\x80\x00\x80\x52\x00\x00\x00\x00\x00\x00\x00\x4B",
+                        "xxxxxx?xxxxx???????x"
+                    );
+                    if (match)
+                    {
+                        match += 8; // Point 80 00 80 52
+                        insnNew = 0x52800020; // MOV W0, #1
+                    }
+                }
             }
         }
-        // TODO Revisit once forced-on
+        if (match && VirtualProtect(match, 4, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+        {
+            *(DWORD*)match = insnNew;
+            VirtualProtect(match, 4, dwOldProtect, &dwOldProtect);
+        }
 #endif
     }
 }
@@ -10734,24 +10860,16 @@ HWND user32_NtUserFindWindowExHook(HWND hWndParent, HWND hWndChildAfter, LPCWSTR
 
 
 #pragma region "Infrastructure for reporting which OS features are enabled"
-#pragma pack(push, 1)
-struct RTL_FEATURE_CONFIGURATION {
-    unsigned int featureId;
-    unsigned __int32 group : 4;
-    unsigned __int32 enabledState : 2;
-    unsigned __int32 enabledStateOptions : 1;
-    unsigned __int32 unused1 : 1;
-    unsigned __int32 variant : 6;
-    unsigned __int32 variantPayloadKind : 2;
-    unsigned __int32 unused2 : 16;
-    unsigned int payload;
-};
-#pragma pack(pop)
 
-int (*RtlQueryFeatureConfigurationFunc)(UINT32 featureId, int sectionType, INT64* changeStamp, struct RTL_FEATURE_CONFIGURATION* buffer);
-int RtlQueryFeatureConfigurationHook(UINT32 featureId, int sectionType, INT64* changeStamp, struct RTL_FEATURE_CONFIGURATION* buffer) {
-    int rv = RtlQueryFeatureConfigurationFunc(featureId, sectionType, changeStamp, buffer);
-    switch (featureId)
+#include "inc/rtlfeatureconfig.h"
+
+RTL_QUERY_FEATURE_CONFIGURATION* RtlQueryFeatureConfigurationFunc;
+NTSTATUS NTAPI RtlQueryFeatureConfigurationHook(
+    RTL_FEATURE_ID FeatureId, RTL_FEATURE_CONFIGURATION_TYPE ConfigurationType, RTL_FEATURE_CHANGE_STAMP* ChangeStamp,
+    RTL_FEATURE_CONFIGURATION* FeatureConfiguration)
+{
+    NTSTATUS rv = RtlQueryFeatureConfigurationFunc(FeatureId, ConfigurationType, ChangeStamp, FeatureConfiguration);
+    switch (FeatureId)
     {
 #if !USE_MOMENT_3_FIXES_ON_MOMENT_2
         case 26008830: // STTest
@@ -10766,7 +10884,7 @@ int RtlQueryFeatureConfigurationHook(UINT32 featureId, int sectionType, INT64* c
                 //
                 // Removed in 22621.2134+
                 //
-                buffer->enabledState = FEATURE_ENABLED_STATE_DISABLED;
+                FeatureConfiguration->EnabledState = FeatureEnabledStateDisabled;
             }
             break;
         }
@@ -10779,7 +10897,7 @@ int RtlQueryFeatureConfigurationHook(UINT32 featureId, int sectionType, INT64* c
                 // Crashing on 22635.2915
                 if ((global_rovi.dwBuildNumber >= 22621 && global_rovi.dwBuildNumber <= 22635) && global_ubr >= 2915)
                     break;
-                buffer->enabledState = FEATURE_ENABLED_STATE_DISABLED;
+                FeatureConfiguration->EnabledState = FeatureEnabledStateDisabled;
             }
             break;
         }
@@ -10792,7 +10910,7 @@ int RtlQueryFeatureConfigurationHook(UINT32 featureId, int sectionType, INT64* c
                 // Crashing on 22635.2915
                 if ((global_rovi.dwBuildNumber >= 22621 && global_rovi.dwBuildNumber <= 22635) && global_ubr >= 2915)
                     break;
-                buffer->enabledState = FEATURE_ENABLED_STATE_DISABLED;
+                FeatureConfiguration->EnabledState = FeatureEnabledStateDisabled;
             }
             break;
         }
@@ -10802,7 +10920,7 @@ int RtlQueryFeatureConfigurationHook(UINT32 featureId, int sectionType, INT64* c
             if (bOldTaskbar)
             {
                 // Sorry Microsoft, but we need more time. Peace ✌️
-                buffer->enabledState = FEATURE_ENABLED_STATE_DISABLED;
+                FeatureConfiguration->EnabledState = FeatureEnabledStateDisabled;
             }
             break;
         }
@@ -10814,7 +10932,7 @@ int RtlQueryFeatureConfigurationHook(UINT32 featureId, int sectionType, INT64* c
                 // This feature flag when enabled makes the flyouts disregard the left and right offsets, so that they
                 // appear over the Copilot sidebar instead of beside it. Disabling this fixes start menu positioning
                 // when the taskbar is at the left or right side, but it will make that behavior occur again.
-                buffer->enabledState = FEATURE_ENABLED_STATE_DISABLED;
+                FeatureConfiguration->EnabledState = FeatureEnabledStateDisabled;
             }
             break;
         }
@@ -10828,12 +10946,13 @@ DWORD InjectBasicFunctions(BOOL bIsExplorer, BOOL bInstall)
 {
     //Sleep(150);
 
-    HMODULE hShlwapi = LoadLibraryW(L"Shlwapi.dll");
+    HMODULE hShlwapi = LoadLibraryExW(L"Shlwapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (hShlwapi)
     {
         if (bInstall)
         {
             SHRegGetValueFromHKCUHKLMFunc = GetProcAddress(hShlwapi, "SHRegGetValueFromHKCUHKLM");
+            SHRegGetBoolValueFromHKCUHKLMFunc = GetProcAddress(hShlwapi, "SHRegGetBoolValueFromHKCUHKLM");
         }
         else
         {
@@ -10842,7 +10961,7 @@ DWORD InjectBasicFunctions(BOOL bIsExplorer, BOOL bInstall)
         }
     }
 
-    HANDLE hShell32 = LoadLibraryW(L"shell32.dll");
+    HANDLE hShell32 = LoadLibraryExW(L"shell32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (hShell32)
     {
         if (bInstall)
@@ -10885,7 +11004,7 @@ DWORD InjectBasicFunctions(BOOL bIsExplorer, BOOL bInstall)
         }
     }
 
-    HANDLE hShcore = LoadLibraryW(L"shcore.dll");
+    HANDLE hShcore = LoadLibraryExW(L"shcore.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (hShcore)
     {
         if (bInstall)
@@ -10899,7 +11018,7 @@ DWORD InjectBasicFunctions(BOOL bIsExplorer, BOOL bInstall)
         }
     }
 
-    HANDLE hExplorerFrame = LoadLibraryW(L"ExplorerFrame.dll");
+    HANDLE hExplorerFrame = LoadLibraryExW(L"ExplorerFrame.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (hExplorerFrame)
     {
         if (bInstall)
@@ -10922,20 +11041,23 @@ DWORD InjectBasicFunctions(BOOL bIsExplorer, BOOL bInstall)
             VnPatchIAT(hExplorerFrame, "user32.dll", "LoadAcceleratorsW", ExplorerFrame_LoadAcceleratorsW);
             VnPatchIAT(hExplorerFrame, "user32.dll", "GetSystemMetricsForDpi", explorerframe_GetSystemMetricsForDpi);
 #if WITH_MAIN_PATCHER
-            MODULEINFO mi;
-            GetModuleInformation(GetCurrentProcess(), hExplorerFrame, &mi, sizeof(MODULEINFO));
-            if (bShrinkExplorerAddressBar)
+            PBYTE pExplorerFrameText;
+            DWORD cbExplorerFrameText;
+            if (TextSectionBeginAndSize(hExplorerFrame, &pExplorerFrameText, &cbExplorerFrameText))
             {
-                if ((global_rovi.dwBuildNumber >= 19041 && global_rovi.dwBuildNumber <= 19045 && global_ubr < 3754) || IsWindows11())
+                if (bShrinkExplorerAddressBar)
                 {
-                    PatchAddressBarSizing(&mi);
+                    if ((global_rovi.dwBuildNumber >= 19041 && global_rovi.dwBuildNumber <= 19045 && global_ubr < 3754) || IsWindows11())
+                    {
+                        PatchAddressBarSizing(pExplorerFrameText, cbExplorerFrameText);
+                    }
                 }
-            }
-            if ((dwFileExplorerCommandUI == 1 || dwFileExplorerCommandUI == 2)
-                && ((global_rovi.dwBuildNumber >= 22621 && global_rovi.dwBuildNumber <= 22635 && global_ubr >= 160)
-                    || global_rovi.dwBuildNumber >= 25136))
-            {
-                FixTIFEBreakagesForLegacyControlInterfaces(&mi);
+                if ((dwFileExplorerCommandUI == 1 || dwFileExplorerCommandUI == 2)
+                    && ((global_rovi.dwBuildNumber >= 22621 && global_rovi.dwBuildNumber <= 22635 && global_ubr >= 160)
+                        || global_rovi.dwBuildNumber >= 25136))
+                {
+                    FixTIFEBreakagesForLegacyControlInterfaces(pExplorerFrameText, cbExplorerFrameText);
+                }
             }
 #endif
             VnPatchIAT(hExplorerFrame, "api-ms-win-core-com-l1-1-0.dll", "CoCreateInstance", ExplorerFrame_CoCreateInstanceHook);
@@ -11001,7 +11123,7 @@ DWORD InjectBasicFunctions(BOOL bIsExplorer, BOOL bInstall)
     // As of writing, this function is never invoked with bInstall=TRUE, so we don't handle the case if it's false for now
     if (bIsExplorerProcess)
     {
-        RtlQueryFeatureConfigurationFunc = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlQueryFeatureConfiguration");
+        RtlQueryFeatureConfigurationFunc = (RTL_QUERY_FEATURE_CONFIGURATION*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlQueryFeatureConfiguration");
         int rv = -1;
         if (RtlQueryFeatureConfigurationFunc)
         {
@@ -11018,7 +11140,7 @@ DWORD InjectBasicFunctions(BOOL bIsExplorer, BOOL bInstall)
 
         if (!bIsExplorer && IsXamlSoundsEnabled())
         {
-            HANDLE hCombase = LoadLibraryW(L"combase.dll");
+            HANDLE hCombase = LoadLibraryExW(L"combase.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
             VnPatchIAT(hCombase, "api-ms-win-core-libraryloader-l1-2-0.dll", "LoadLibraryExW", combase_LoadLibraryExW);
         }
     }
@@ -11065,93 +11187,10 @@ BOOL explorer_IsOS(DWORD dwOS)
 
 #pragma region "Find offsets of needed functions when symbols are not available"
 #if WITH_MAIN_PATCHER
-void TryToFindExplorerOffsets(HANDLE hExplorer, MODULEINFO* pmiExplorer, DWORD* pOffsets)
+void TryToFindExplorerOffsets(HANDLE hExplorer, PBYTE pSearchBegin, size_t cbSearch, DWORD* pOffsets)
 {
-    if (!pOffsets[0] || pOffsets[0] == 0xFFFFFFFF)
-    {
-        // ImmersiveTray::AttachWindowToTray()
-#if defined(_M_X64)
-        // 48 8B 93 ?? ?? ?? ?? 48 8B 8B ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8B 4B
-        //                                              ^^^^^^^^^^^
-        // Ref: CTaskListThumbnailWnd::SetSite()
-        PBYTE match = FindPattern(
-            hExplorer, pmiExplorer->SizeOfImage,
-            "\x48\x8B\x93\x00\x00\x00\x00\x48\x8B\x8B\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x48\x8B\x4B",
-            "xxx????xxx????x????xxx"
-        );
-        if (match)
-        {
-            match += 14;
-            pOffsets[0] = match + 5 + *(int*)(match + 1) - (PBYTE)hExplorer;
-            printf("explorer.exe!ImmersiveTray::AttachWindowToTray() = %lX\n", pOffsets[0]);
-        }
-#endif
-    }
-
-    if (!pOffsets[1] || pOffsets[1] == 0xFFFFFFFF)
-    {
-        // ImmersiveTray::RaiseWindow()
-#if defined(_M_X64)
-        // 41 B9 02 00 00 00 48 8B 8B ?? ?? ?? ?? E8 ?? ?? ?? ?? 85 C0
-        //                                           ^^^^^^^^^^^
-        // Ref: CTaskListThumbnailWnd::_RaiseWindowForLivePreviewIfNeeded()
-        PBYTE match = FindPattern(
-            hExplorer, pmiExplorer->SizeOfImage,
-            "\x41\xB9\x02\x00\x00\x00\x48\x8B\x8B\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x85\xC0",
-            "xxxxxxxxx????x????xx"
-        );
-        if (match)
-        {
-            match += 13;
-            pOffsets[1] = match + 5 + *(int*)(match + 1) - (PBYTE)hExplorer;
-            printf("explorer.exe!ImmersiveTray::RaiseWindow() = %lX\n", pOffsets[1]);
-        }
-#endif
-    }
-
-    if (!pOffsets[2] || pOffsets[2] == 0xFFFFFFFF)
-    {
-        // CTaskBand_CreateInstance()
-#if defined(_M_X64)
-        // Pre-24H2 (output variable uninitialized)
-        // Tested: 19041.3758, 22000.51, 22621.1992
-        // 48 8B F1 4C 8D 44 24 ?? 48 8B 49 ?? 33 D2 E8 ?? ?? ?? ??
-        //                                              ^^^^^^^^^^^
-        // Ref: CTrayBandSite::_AddRequiredBands()
-        PBYTE match = FindPattern(
-            hExplorer, pmiExplorer->SizeOfImage,
-            "\x48\x8B\xF1\x4C\x8D\x44\x24\x00\x48\x8B\x49\x00\x33\xD2\xE8",
-            "xxxxxxx?xxx?xxx"
-        );
-        if (match)
-        {
-            match += 14;
-            pOffsets[2] = match + 5 + *(int*)(match + 1) - (PBYTE)hExplorer;
-        }
-        else
-        {
-            // 24H2 (output variable initialized to 0)
-            // Tested: 25951, 26080
-            // 4C 8D 40 ?? 48 8B F1 33 D2 48 8B 49 ?? E8 ?? ?? ?? ??
-            //                                           ^^^^^^^^^^^
-            // Ref: CTrayBandSite::_AddRequiredBands()
-            match = FindPattern(
-                hExplorer, pmiExplorer->SizeOfImage,
-                "\x4C\x8D\x40\x00\x48\x8B\xF1\x33\xD2\x48\x8B\x49\x00\xE8",
-                "xxx?xxxxxxxx?x"
-            );
-            if (match)
-            {
-                match += 13;
-                pOffsets[2] = match + 5 + *(int*)(match + 1) - (PBYTE)hExplorer;
-            }
-        }
-        if (match)
-        {
-            printf("explorer.exe!CTaskBand_CreateInstance() = %lX\n", pOffsets[2]);
-        }
-#endif
-    }
+    if (!pSearchBegin || !cbSearch)
+        return;
 
     if (!pOffsets[3] || pOffsets[3] == 0xFFFFFFFF)
     {
@@ -11163,7 +11202,7 @@ void TryToFindExplorerOffsets(HANDLE hExplorer, MODULEINFO* pmiExplorer, DWORD* 
         //                                                 ^^^^^^^^^^^
         // Ref: TrayUI::WndProc()
         PBYTE match = FindPattern(
-            hExplorer, pmiExplorer->SizeOfImage,
+            pSearchBegin, cbSearch,
             "\x4D\x85\x00\x74\x00\x49\x83\x00\x01\x75\x00\xE8",
             "xx?x?xx?xx?x"
         );
@@ -11179,7 +11218,7 @@ void TryToFindExplorerOffsets(HANDLE hExplorer, MODULEINFO* pmiExplorer, DWORD* 
             // 4D 85 ?? 74 ?? 49 83 ?? 01 0F 85 ?? ?? ?? ?? E8 ?? ?? ?? ??
             //                                                 ^^^^^^^^^^^
             match = FindPattern(
-                hExplorer, pmiExplorer->SizeOfImage,
+                pSearchBegin, cbSearch,
                 "\x4D\x85\x00\x74\x00\x49\x83\x00\x01\x0F\x85\x00\x00\x00\x00\xE8",
                 "xx?x?xx?xxx????x"
             );
@@ -11204,7 +11243,7 @@ void TryToFindExplorerOffsets(HANDLE hExplorer, MODULEINFO* pmiExplorer, DWORD* 
         // 48 8B F9 E8 ?? ?? ?? ?? 8B D8 85 C0 78 ?? 48 8B CF E8 ?? ?? ?? ??
         //                                                       ^^^^^^^^^^^
         PBYTE match = FindPattern(
-            hExplorer, pmiExplorer->SizeOfImage,
+            pSearchBegin, cbSearch,
             "\x48\x8B\xF9\xE8\x00\x00\x00\x00\x8B\xD8\x85\xC0\x78\x00\x48\x8B\xCF\xE8",
             "xxxx????xxxxx?xxxx"
         );
@@ -11231,9 +11270,12 @@ extern HRESULT AppResolver_CAppResolverCacheBuilder__AddUserPinnedShortcutToStar
 
 static void PatchAppResolver()
 {
-    HANDLE hAppResolver = LoadLibraryW(L"AppResolver.dll");
-    MODULEINFO miAppResolver;
-    GetModuleInformation(GetCurrentProcess(), hAppResolver, &miAppResolver, sizeof(MODULEINFO));
+    HANDLE hAppResolver = LoadLibraryExW(L"AppResolver.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+
+    PBYTE pAppResolverText;
+    DWORD cbAppResolverText;
+    if (!TextSectionBeginAndSize(hAppResolver, &pAppResolverText, &cbAppResolverText))
+        return;
 
     VnPatchDelayIAT(hAppResolver, "api-ms-win-core-winrt-l1-1-0.dll", "RoGetActivationFactory", AppResolver_StartTileData_RoGetActivationFactory);
 
@@ -11243,8 +11285,8 @@ static void PatchAppResolver()
     //                  ^^^^^^^
     // Ref: CAppResolverCacheBuilder::_AddShortcutToCache()
     PBYTE match = FindPattern(
-        hAppResolver,
-        miAppResolver.SizeOfImage,
+        pAppResolverText,
+        cbAppResolverText,
         "\x8B\x00\x48\x8B\xD3\xE8\x00\x00\x00\x00\x48\x8B\x8D",
         "x?xxxx????xxx"
     );
@@ -11254,17 +11296,34 @@ static void PatchAppResolver()
         match += 5 + *(int*)(match + 1);
     }
 #elif defined(_M_ARM64)
+    // Nickel+
     // 7F 23 03 D5  FD 7B BC A9  F3 53 01 A9  F5 5B 02 A9  F7 1B 00 F9  FD 03 00 91  ?? ?? ?? ??  FF 43 01 D1  F7 03 00 91  30 00 80 92  F0 1A 00 F9  ?? 03 01 AA  ?? 03 02 AA  FF ?? 00 F9
     // ----------- PACIBSP, don't scan for this because it's everywhere
-    PBYTE match = FindPattern(
-        hAppResolver,
-        miAppResolver.SizeOfImage,
+    PBYTE match = FindPattern_4_(
+        pAppResolverText,
+        cbAppResolverText,
         "\xFD\x7B\xBC\xA9\xF3\x53\x01\xA9\xF5\x5B\x02\xA9\xF7\x1B\x00\xF9\xFD\x03\x00\x91\x00\x00\x00\x00\xFF\x43\x01\xD1\xF7\x03\x00\x91\x30\x00\x80\x92\xF0\x1A\x00\xF9\x00\x03\x01\xAA\x00\x03\x02\xAA\xFF\x00\x00\xF9",
         "xxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxx?xxx?xxxx?xx"
     );
     if (match)
     {
         match -= 4;
+    }
+    else
+    {
+        // Cobalt
+        // 7F 23 03 D5  FD 7B BC A9  F3 53 01 A9  F5 5B 02 A9  F7 1B 00 F9  F9 1F 00 F9  FD 03 00 91  ?? ?? ?? ??  FF 43 01 D1  F7 03 00 91  30 00 80 92  F0 1A 00 F9  ?? 03 01 AA  ?? 03 02 AA  FF ?? 00 F9
+        // ----------- PACIBSP, don't scan for this because it's everywhere
+        match = (PBYTE)FindPattern_4_(
+            pAppResolverText,
+            cbAppResolverText,
+            "\xFD\x7B\xBC\xA9\xF3\x53\x01\xA9\xF5\x5B\x02\xA9\xF7\x1B\x00\xF9\xF9\x1F\x00\xF9\xFD\x03\x00\x91\x00\x00\x00\x00\xFF\x43\x01\xD1\xF7\x03\x00\x91\x30\x00\x80\x92\xF0\x1A\x00\xF9\x00\x03\x01\xAA\x00\x03\x02\xAA\xFF\x00\x00\xF9",
+            "xxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxxxx?xxx?xxxx?xx"
+        );
+        if (match)
+        {
+            match -= 4;
+        }
     }
 #endif
     if (match)
@@ -11292,7 +11351,7 @@ extern HRESULT PatchStartTileDataFurther(HMODULE hModule, BOOL bSMEH);
 
 static void PatchStartTileData(BOOL bSMEH)
 {
-    HANDLE hStartTileData = LoadLibraryW(L"StartTileData.dll");
+    HANDLE hStartTileData = LoadLibraryExW(L"StartTileData.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
 
     VnPatchIAT(hStartTileData, "api-ms-win-core-winrt-l1-1-0.dll", "RoGetActivationFactory", AppResolver_StartTileData_RoGetActivationFactory);
 
@@ -11618,14 +11677,16 @@ EP_TASKBAR_FEATURES GetEPTaskbarFeatures()
         eptf |= EPTF_Taskbar;
     }
 
-    BOOL fValue = FALSE;
-    if (SUCCEEDED(SHRegGetBOOLWithREGSAM(HKEY_CURRENT_USER, L"Software\\ExplorerPatcher", L"UseImmersiveLauncher", 0, &fValue)) && fValue)
+    DWORD dwValue = 0;
+    if (SUCCEEDED(SHRegGetDWORD(HKEY_CURRENT_USER, L"Software\\ExplorerPatcher", L"CustomStart_Primary", &dwValue))
+        && dwValue >= 1 && dwValue <= 3)
     {
         eptf |= EPTF_WinBlueLauncher;
     }
 
-    DWORD dwValue = 0;
-    if (SUCCEEDED(SHRegGetDWORD(HKEY_CURRENT_USER, L"Software\\ExplorerPatcher", L"AudioFlyoutStyle", &dwValue)) && dwValue == 1)
+    dwValue = 0;
+    if (SUCCEEDED(SHRegGetDWORD(HKEY_CURRENT_USER, L"Software\\ExplorerPatcher", L"AudioFlyoutStyle", &dwValue))
+        && dwValue == 1)
     {
         eptf |= EPTF_AudioFlyout;
     }
@@ -12210,7 +12271,7 @@ DWORD Inject(BOOL bIsExplorer)
     }
 
 
-    HANDLE hUser32 = LoadLibraryW(L"user32.dll");
+    HANDLE hUser32 = LoadLibraryExW(L"user32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     CreateWindowInBand = GetProcAddress(hUser32, "CreateWindowInBand");
     GetWindowBand = GetProcAddress(hUser32, "GetWindowBand");
     SetWindowBand = GetProcAddress(hUser32, "SetWindowBand");
@@ -12222,12 +12283,15 @@ DWORD Inject(BOOL bIsExplorer)
 
 
     HANDLE hExplorer = GetModuleHandleW(NULL);
-    MODULEINFO miExplorer;
-    GetModuleInformation(GetCurrentProcess(), hExplorer, &miExplorer, sizeof(MODULEINFO));
 
-    if (IsWindows11Version22H2OrHigher())
+    PBYTE pExplorerText;
+    DWORD cbExplorerText;
+    TextSectionBeginAndSize(hExplorer, &pExplorerText, &cbExplorerText);
+
+    if (IsWindows11Version22H2OrHigher()
+        && (global_rovi.dwBuildNumber < 26100 || (global_rovi.dwBuildNumber == 26100 && global_ubr < 1301)))
     {
-        TryToFindExplorerOffsets(hExplorer, &miExplorer, symbols_PTRS.explorer_PTRS);
+        TryToFindExplorerOffsets(hExplorer, pExplorerText, cbExplorerText, symbols_PTRS.explorer_PTRS);
     }
 
     const WCHAR* pszTaskbarDll = GetTaskbarDllChecked(&symbols_PTRS);
@@ -12322,8 +12386,8 @@ DWORD Inject(BOOL bIsExplorer)
         //                               ^^^^^^^^^^^    ^^^^^^^^^^^
         // Ref: CTray::Init()
         PBYTE match = FindPattern(
-            hExplorer,
-            miExplorer.SizeOfImage,
+            pExplorerText,
+            cbExplorerText,
             "\x4C\x8D\x05\x00\x00\x00\x00\x48\x8D\x0D\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x48\x8B",
             "xxx????xxx????x????xx"
         );
@@ -12345,11 +12409,23 @@ DWORD Inject(BOOL bIsExplorer)
         //                               ^^^^^^^^^^^    ^^^^^^^^^^^
         // Ref: CTray::Init()
         PBYTE match = FindPattern(
-            hExplorer,
-            miExplorer.SizeOfImage,
+            pExplorerText,
+            cbExplorerText,
             "\x4C\x8D\x05\x00\x00\x00\x00\x48\x8D\x0D\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x85\xC0",
             "xxx????xxx????x????xx"
         );
+        if (!match)
+        {
+            // 20348 (Iron; Server 2022)
+            // 4C 8D 05 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8B
+            //                                              ^^^^^^^^^^^
+            match = FindPattern(
+                pExplorerText,
+                cbExplorerText,
+                "\x4C\x8D\x05\x00\x00\x00\x00\x48\x8D\x0D\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x48\x8B",
+                "xxx????xxx????x????xx"
+            );
+        }
         if (match)
         {
             match += 7; // Point to 48
@@ -12378,7 +12454,7 @@ DWORD Inject(BOOL bIsExplorer)
         UpdateSearchBox();
     }
 
-    HANDLE hShcore = LoadLibraryW(L"shcore.dll");
+    HANDLE hShcore = LoadLibraryExW(L"shcore.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     SHWindowsPolicy = GetProcAddress(hShcore, (LPCSTR)190);
 #ifdef USE_PRIVATE_INTERFACES
     explorer_SHCreateStreamOnModuleResourceWFunc = GetProcAddress(hShcore, (LPCSTR)109);
@@ -12416,7 +12492,7 @@ DWORD Inject(BOOL bIsExplorer)
 
 
 
-    HANDLE hUxtheme = LoadLibraryW(L"uxtheme.dll");
+    HANDLE hUxtheme = LoadLibraryExW(L"uxtheme.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     GetThemeName = (GetThemeName_t)GetProcAddress(hUxtheme, MAKEINTRESOURCEA(74));
     RefreshImmersiveColorPolicyState = (RefreshImmersiveColorPolicyState_t)GetProcAddress(hUxtheme, MAKEINTRESOURCEA(104));
     GetIsImmersiveColorUsingHighContrast = (GetIsImmersiveColorUsingHighContrast_t)GetProcAddress(hUxtheme, MAKEINTRESOURCEA(106));
@@ -12451,7 +12527,7 @@ DWORD Inject(BOOL bIsExplorer)
         Win10TaskbarHooks_PatchEPTaskbarVtables(hMyTaskbar);
     }
 
-    HANDLE hCombase = LoadLibraryW(L"combase.dll");
+    HANDLE hCombase = LoadLibraryExW(L"combase.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (IsWindows11())
     {
         if (IsWindows11Version22H2OrHigher())
@@ -12467,7 +12543,7 @@ DWORD Inject(BOOL bIsExplorer)
     printf("Setup combase functions done\n");
 
 
-    HANDLE hTwinui = LoadLibraryW(L"twinui.dll");
+    HANDLE hTwinui = LoadLibraryExW(L"twinui.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!IsWindows11())
     {
         VnPatchIAT(hTwinui, "user32.dll", "TrackPopupMenu", twinui_TrackPopupMenuHook);
@@ -12479,7 +12555,7 @@ DWORD Inject(BOOL bIsExplorer)
     printf("Setup twinui functions done\n");
 
 
-    HANDLE hStobject = LoadLibraryW(L"stobject.dll");
+    HANDLE hStobject = LoadLibraryExW(L"stobject.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (hStobject)
     {
         VnPatchIAT(hStobject, "api-ms-win-core-registry-l1-1-0.dll", "RegGetValueW", stobject_RegGetValueW);
@@ -12523,7 +12599,7 @@ DWORD Inject(BOOL bIsExplorer)
 
     if (global_rovi.dwBuildNumber < 25236)
     {
-        HANDLE hPnidui = LoadLibraryW(L"pnidui.dll");
+        HANDLE hPnidui = LoadLibraryExW(L"pnidui.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (hPnidui)
         {
             PatchPnidui(hPnidui);
@@ -12629,7 +12705,7 @@ DWORD Inject(BOOL bIsExplorer)
 
     if (IsWindows11())
     {
-        HANDLE hInputSwitch = LoadLibraryW(L"InputSwitch.dll");
+        HANDLE hInputSwitch = LoadLibraryExW(L"InputSwitch.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (bOldTaskbar)
         {
             printf("[IME] Context menu patch status: %d\n", PatchContextMenuOfNewMicrosoftIME(NULL));
@@ -12644,7 +12720,7 @@ DWORD Inject(BOOL bIsExplorer)
         HANDLE hWindowsudkShellcommon = LoadLibraryW(L"windowsudk.shellcommon.dll");
         if (hWindowsudkShellcommon)
         {
-            HANDLE hSLC = LoadLibraryW(L"slc.dll");
+            HANDLE hSLC = LoadLibraryExW(L"slc.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
             if (hSLC)
             {
                 SLGetWindowsInformationDWORDFunc = GetProcAddress(hSLC, "SLGetWindowsInformationDWORD");
@@ -12659,7 +12735,7 @@ DWORD Inject(BOOL bIsExplorer)
 
 
 
-    HANDLE hPeopleBand = LoadLibraryW(L"PeopleBand.dll");
+    HANDLE hPeopleBand = LoadLibraryExW(L"PeopleBand.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (hPeopleBand)
     {
         if (IsOS(OS_ANYSERVER)) VnPatchIAT(hPeopleBand, "SHLWAPI.dll", (LPCSTR)437, PeopleBand_IsOS);
@@ -12695,7 +12771,12 @@ DWORD Inject(BOOL bIsExplorer)
         }
         else
         {
-            CreateThread(0, 0, FixTaskbarAutohide, 0, 0, 0);
+            BOOL bStockTaskbarAutohideOk = global_rovi.dwBuildNumber > 22000
+                || (global_rovi.dwBuildNumber == 22000 && global_ubr >= 318);
+            if (!bStockTaskbarAutohideOk)
+            {
+                CreateThread(0, 0, FixTaskbarAutohide, 0, 0, 0);
+            }
         }
     }
 
@@ -12921,15 +13002,18 @@ void StartMenu_LoadSettings(BOOL bRestartIfChanged)
     }
     if (hKey)
     {
-        dwSize = sizeof(DWORD);
-        RegQueryValueExW(
-            hKey,
-            TEXT("MakeAllAppsDefault"),
-            0,
-            NULL,
-            &StartMenu_ShowAllApps,
-            &dwSize
-        );
+        if (!IsRedesignedWin11StartMenu())
+        {
+            dwSize = sizeof(DWORD);
+            RegQueryValueExW(
+                hKey,
+                TEXT("MakeAllAppsDefault"),
+                0,
+                NULL,
+                &StartMenu_ShowAllApps,
+                &dwSize
+            );
+        }
         dwSize = sizeof(DWORD);
         RegQueryValueExW(
             hKey,
@@ -13199,11 +13283,11 @@ INT64(*StartDocked_StartSizingFrame_StartSizingFrameFunc)(void* _this) = NULL;
 INT64 StartDocked_StartSizingFrame_StartSizingFrameHook(void* _this)
 {
     INT64 rv = StartDocked_StartSizingFrame_StartSizingFrameFunc(_this);
-    HMODULE hModule = LoadLibraryW(L"Shlwapi.dll");
+    HMODULE hModule = LoadLibraryExW(L"Shlwapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (hModule)
     {
         DWORD dwStatus = 0, dwSize = sizeof(DWORD);
-        t_SHRegGetValueFromHKCUHKLM SHRegGetValueFromHKCUHKLMFunc = GetProcAddress(hModule, "SHRegGetValueFromHKCUHKLM");
+        SHRegGetValueFromHKCUHKLM_t SHRegGetValueFromHKCUHKLMFunc = GetProcAddress(hModule, "SHRegGetValueFromHKCUHKLM");
         if (!SHRegGetValueFromHKCUHKLMFunc || SHRegGetValueFromHKCUHKLMFunc(
             TEXT("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"),
             TEXT("TaskbarAl"),
@@ -13284,45 +13368,67 @@ static BOOL StartMenu_FixContextMenuXbfHijackMethod()
     if (!hWindowsUIXaml)
         return FALSE;
 
-    MODULEINFO mi;
-    GetModuleInformation(GetCurrentProcess(), hWindowsUIXaml, &mi, sizeof(mi));
+    PBYTE pWindowsUIXamlText;
+    DWORD cbWindowsUIXamlText;
+    if (!TextSectionBeginAndSize(hWindowsUIXaml, &pWindowsUIXamlText, &cbWindowsUIXamlText))
+        return FALSE;
 
     if (!StartMenu_FillParserBuffer(&g_EmptyRefreshedStylesXbfBuffer, IDR_REFRESHEDSTYLES_XBF))
         return FALSE;
 
 #if defined(_M_X64)
-    // 49 89 43 C8 E8 ?? ?? ?? ?? 85 C0
-    //                ^^^^^^^^^^^
+    // 48 8B 45 ?? 49 89 43 C8 E8 ?? ?? ?? ?? 85 C0
+    //                            ^^^^^^^^^^^
     // Ref: CCoreServices::LoadXamlResource()
     PBYTE match = FindPattern(
-        mi.lpBaseOfDll,
-        mi.SizeOfImage,
-        "\x49\x89\x43\xC8\xE8\x00\x00\x00\x00\x85\xC0",
-        "xxxxx????xx"
+        pWindowsUIXamlText,
+        cbWindowsUIXamlText,
+        "\x48\x8B\x45\x00\x49\x89\x43\xC8\xE8\x00\x00\x00\x00\x85\xC0",
+        "xxx?xxxxx????xx"
     );
-    if (!match)
-        return FALSE;
-
-    match += 4;
-    match += 5 + *(int*)(match + 1);
+    if (match)
+    {
+        match += 8;
+        match += 5 + *(int*)(match + 1);
+    }
+    else
+    {
+        // 29553+
+        // 48 8B 45 48 48 89 44 24 ?? E8 ?? ?? ?? ?? 85 C0
+        //                               ^^^^^^^^^^^
+        // Ref: CCoreServices::LoadXamlResource()
+        match = FindPattern(
+            pWindowsUIXamlText,
+            cbWindowsUIXamlText,
+            "\x48\x8B\x45\x48\x48\x89\x44\x24\x00\xE8\x00\x00\x00\x00\x85\xC0",
+            "xxxxxxxx?x????xx"
+        );
+        if (match)
+        {
+            match += 9;
+            match += 5 + *(int*)(match + 1);
+        }
+    }
 #elif defined(_M_ARM64)
-    // E1 0B 40 F9 05 00 80 D2 04 00 80 D2 E3 03 ?? AA E2 03 ?? AA E0 03 ?? AA ?? ?? ?? 97
+    // E1 0B 40 F9 05 00 80 D2 04 00 80 D2 E3 03 ?? AA E2 03 ?? AA E0 03 ?? AA ?? ?? ?? ?? ?? 03 00 2A
     //                                                                         ^^^^^^^^^^^
     // Ref: CoreServices_TryGetApplicationResource()
-    PBYTE match = FindPattern(
-        mi.lpBaseOfDll,
-        mi.SizeOfImage,
-        "\xE1\x0B\x40\xF9\x05\x00\x80\xD2\x04\x00\x80\xD2\xE3\x03\x00\xAA\xE2\x03\x00\xAA\xE0\x03\x00\xAA\x00\x00\x00\x97",
-        "xxxxxxxxxxxxxx?xxx?xxx?x???x"
+    PBYTE match = FindPattern_4_(
+        pWindowsUIXamlText,
+        cbWindowsUIXamlText,
+        "\xE1\x0B\x40\xF9\x05\x00\x80\xD2\x04\x00\x80\xD2\xE3\x03\x00\xAA\xE2\x03\x00\xAA\xE0\x03\x00\xAA\x00\x00\x00\x00\x00\x03\x00\x2A",
+        "xxxxxxxxxxxxxx?xxx?xxx?x?????xxx"
     );
-    if (!match)
-        return FALSE;
-
-    match += 24;
-    match = (PBYTE)ARM64_FollowBL((DWORD*)match);
-    if (!match)
-        return FALSE;
+    if (match)
+    {
+        match += 24;
+        match = (PBYTE)ARM64_FollowBL((DWORD*)match);
+    }
 #endif
+    if (!match)
+    {
+        return FALSE;
+    }
 
     CCoreServices_TryLoadXamlResourceHelperFunc = match;
     funchook_prepare(
@@ -13346,15 +13452,18 @@ void StartUI_UserTileView_AppendMenuFlyoutItemCommandHook(void* _this, void* men
     StartUI_UserTileView_AppendMenuFlyoutItemCommandFunc(_this, menuFlyout, userTileCommand, id);
 }
 
-static void StartMenu_FixUserTileMenu(MODULEINFO* mi)
+static void StartMenu_FixUserTileMenu(PBYTE pSearchBegin, size_t cbSearch)
 {
+    if (!pSearchBegin || !cbSearch)
+        return;
+
 #if defined(_M_X64)
     // 41 B9 03 00 00 00 4D 8B C4 ?? 8B D6 49 8B CD E8 ?? ?? ?? ??
     //                                                 ^^^^^^^^^^^
     // Ref: <lambda_3a9b433356e31b02e54fffbca0ecf3fa>::operator()
     PBYTE match = FindPattern(
-        mi->lpBaseOfDll,
-        mi->SizeOfImage,
+        pSearchBegin,
+        cbSearch,
         "\x41\xB9\x03\x00\x00\x00\x4D\x8B\xC4\x00\x8B\xD6\x49\x8B\xCD\xE8",
         "xxxxxxxxx?xxxxxx"
     );
@@ -13367,9 +13476,9 @@ static void StartMenu_FixUserTileMenu(MODULEINFO* mi)
     // 63 00 80 52 E2 03 1B AA E1 03 14 AA E0 03 19 AA ?? ?? ?? 94
     //                                                 ^^^^^^^^^^^
     // Ref: <lambda_3a9b433356e31b02e54fffbca0ecf3fa>::operator()
-    PBYTE match = FindPattern(
-        mi->lpBaseOfDll,
-        mi->SizeOfImage,
+    PBYTE match = FindPattern_4_(
+        pSearchBegin,
+        cbSearch,
         "\x63\x00\x80\x52\xE2\x03\x1B\xAA\xE1\x03\x14\xAA\xE0\x03\x19\xAA\x00\x00\x00\x94",
         "xxxxxxxxxxxxxxxx???x"
     );
@@ -14038,9 +14147,6 @@ DWORD InjectStartMenu()
 
         if (IsWindows11())
         {
-            MODULEINFO miStartUI;
-            GetModuleInformation(GetCurrentProcess(), hStartUI, &miStartUI, sizeof(miStartUI));
-
             // Fixes Pin to Start/Unpin from Start
             PatchAppResolver();
             PatchStartTileData(TRUE);
@@ -14049,7 +14155,12 @@ DWORD InjectStartMenu()
             StartMenu_FixContextMenuXbfHijackMethod();
 
             // Fixes user tile menu
-            StartMenu_FixUserTileMenu(&miStartUI);
+            PBYTE pStartUIText;
+            DWORD cbStartUIText;
+            if (TextSectionBeginAndSize(hStartUI, &pStartUIText, &cbStartUIText))
+            {
+                StartMenu_FixUserTileMenu(pStartUIText, cbStartUIText);
+            }
 
             // Enables "Show more tiles" setting
             LoadLibraryW(L"Windows.CloudStore.dll");
@@ -14120,11 +14231,11 @@ DWORD InjectStartMenu()
     int rv;
     DWORD dwVal0 = 0, dwVal1 = 0, dwVal2 = 0, dwVal3 = 0, dwVal4 = 0;
 
-    HMODULE hModule = LoadLibraryW(L"Shlwapi.dll");
+    HMODULE hModule = LoadLibraryExW(L"Shlwapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (hModule)
     {
         DWORD dwStatus = 0, dwSize = sizeof(DWORD);
-        t_SHRegGetValueFromHKCUHKLM SHRegGetValueFromHKCUHKLM = GetProcAddress(hModule, "SHRegGetValueFromHKCUHKLM");
+        SHRegGetValueFromHKCUHKLM_t SHRegGetValueFromHKCUHKLM = GetProcAddress(hModule, "SHRegGetValueFromHKCUHKLM");
 
         if (SHRegGetValueFromHKCUHKLM)
         {
@@ -14236,150 +14347,7 @@ DWORD InjectStartMenu()
     return 0;
 }
 
-void InjectShellExperienceHost()
-{
-#if WITH_MAIN_PATCHER
-    HKEY hKey;
-    if (RegOpenKeyW(HKEY_CURRENT_USER, _T(SEH_REGPATH), &hKey) != ERROR_SUCCESS)
-    {
-        return;
-    }
-    RegCloseKey(hKey);
-    HMODULE hQA = LoadLibraryW(L"Windows.UI.QuickActions.dll");
-    if (hQA)
-    {
-        PIMAGE_DOS_HEADER dosHeader = hQA;
-        if (dosHeader->e_magic == IMAGE_DOS_SIGNATURE)
-        {
-            PIMAGE_NT_HEADERS64 ntHeader = (PIMAGE_NT_HEADERS64)((u_char*)dosHeader + dosHeader->e_lfanew);
-            if (ntHeader->Signature == IMAGE_NT_SIGNATURE)
-            {
-                PBYTE pSEHPatchArea = NULL;
-                BYTE seh_pattern1[14] =
-                {
-                    // mov al, 1
-                    0xB0, 0x01,
-                    // jmp + 2
-                    0xEB, 0x02,
-                    // xor al, al
-                    0x32, 0xC0,
-                    // add rsp, 0x20
-                    0x48, 0x83, 0xC4, 0x20,
-                    // pop rdi
-                    0x5F,
-                    // pop rsi
-                    0x5E,
-                    // pop rbx
-                    0x5B,
-                    // ret
-                    0xC3
-                };
-                BYTE seh_off = 12;
-                BYTE seh_pattern2[5] =
-                {
-                    // mov r8b, 3
-                    0x41, 0xB0, 0x03,
-                    // mov dl, 1
-                    0xB2, 0x01
-                };
-                BOOL bTwice = FALSE;
-                PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(ntHeader);
-                for (unsigned int i = 0; i < ntHeader->FileHeader.NumberOfSections; ++i)
-                {
-                    if (section->Characteristics & IMAGE_SCN_CNT_CODE)
-                    {
-                        if (section->SizeOfRawData && !bTwice)
-                        {
-                            PBYTE pSectionBegin = (PBYTE)hQA + section->VirtualAddress;
-                            //DWORD dwOldProtect;
-                            //VirtualProtect(pSectionBegin, section->SizeOfRawData, PAGE_EXECUTE_READWRITE, &dwOldProtect);
-                            PBYTE pCandidate = NULL;
-                            while (TRUE)
-                            {
-                                pCandidate = memmem(
-                                    !pCandidate ? pSectionBegin : pCandidate,
-                                    !pCandidate ? section->SizeOfRawData : (uintptr_t)section->SizeOfRawData - (uintptr_t)(pCandidate - pSectionBegin),
-                                    seh_pattern1,
-                                    sizeof(seh_pattern1)
-                                );
-                                if (!pCandidate)
-                                {
-                                    break;
-                                }
-                                PBYTE pCandidate2 = pCandidate - seh_off - sizeof(seh_pattern2);
-                                if (pCandidate2 > section->VirtualAddress)
-                                {
-                                    if (memmem(pCandidate2, sizeof(seh_pattern2), seh_pattern2, sizeof(seh_pattern2)))
-                                    {
-                                        if (!pSEHPatchArea)
-                                        {
-                                            pSEHPatchArea = pCandidate;
-                                        }
-                                        else
-                                        {
-                                            bTwice = TRUE;
-                                        }
-                                    }
-                                }
-                                pCandidate += sizeof(seh_pattern1);
-                            }
-                            //VirtualProtect(pSectionBegin, section->SizeOfRawData, dwOldProtect, &dwOldProtect);
-                        }
-                    }
-                    section++;
-                }
-                if (pSEHPatchArea && !bTwice)
-                {
-                    DWORD dwOldProtect;
-                    VirtualProtect(pSEHPatchArea, sizeof(seh_pattern1), PAGE_EXECUTE_READWRITE, &dwOldProtect);
-                    pSEHPatchArea[2] = 0x90;
-                    pSEHPatchArea[3] = 0x90;
-                    VirtualProtect(pSEHPatchArea, sizeof(seh_pattern1), dwOldProtect, &dwOldProtect);
-                }
-            }
-        }
-    }
-#endif
-}
-
-// On 22H2 builds, the Windows 10 flyouts for network and battery can be enabled
-// by patching either of the following functions in ShellExperienceHost. I didn't
-// see any differences when patching with any of the 3 methods, although
-// `SharedUtilities::IsWindowsLite` seems to be invoked in more places, whereas `GetProductInfo`
-// and `RtlGetDeviceFamilyInfoEnum` are only called in `FlightHelper::CalculateRepaintEnabled`
-// and either seems to get the job done. YMMV
-
-LSTATUS SEH_RegGetValueW(HKEY hkey, LPCWSTR lpSubKey, LPCWSTR lpValue, DWORD dwFlags, LPDWORD pdwType, PVOID pvData, LPDWORD pcbData) {
-    if (!lstrcmpW(lpValue, L"UseLiteLayout")) { *(DWORD*)pvData = 1; return ERROR_SUCCESS; }
-    return RegGetValueW(hkey, lpSubKey, lpValue, dwFlags, pdwType, pvData, pcbData);
-}
-
-BOOL SEH_RtlGetDeviceFamilyInfoEnum(INT64 u0, PDWORD u1, INT64 u2) {
-    *u1 = 10;
-    return TRUE;
-}
-
-BOOL SEH_GetProductInfo(DWORD dwOSMajorVersion, DWORD dwOSMinorVersion, DWORD dwSpMajorVersion, DWORD dwSpMinorVersion, PDWORD pdwReturnedProductType) {
-    *pdwReturnedProductType = 119;
-    return TRUE;
-}
-
-void InjectShellExperienceHostFor22H2OrHigher() {
-#if WITH_MAIN_PATCHER
-    if (!IsWindows11Version22H2Build1413OrHigher())
-    {
-        HKEY hKey;
-        if (RegOpenKeyW(HKEY_CURRENT_USER, _T(SEH_REGPATH), &hKey) == ERROR_SUCCESS)
-        {
-            RegCloseKey(hKey);
-            HMODULE hQA = LoadLibraryW(L"Windows.UI.QuickActions.dll");
-            if (hQA) VnPatchIAT(hQA, "api-ms-win-core-sysinfo-l1-2-0.dll", "GetProductInfo", SEH_GetProductInfo);
-            // if (hQA) VnPatchIAT(hQA, "ntdll.dll", "RtlGetDeviceFamilyInfoEnum", SEH_RtlGetDeviceFamilyInfoEnum);
-            // if (hQA) VnPatchIAT(hQA, "api-ms-win-core-registry-l1-1-0.dll", "RegGetValueW", SEH_RegGetValueW);
-        }
-    }
-#endif
-}
+void InjectShellExperienceHost();
 
 #if WITH_MAIN_PATCHER
 bool IsUserOOBE()
@@ -14482,12 +14450,6 @@ HRESULT EntryPoint(DWORD dwMethod)
         {
             return E_NOINTERFACE;
         }
-        TCHAR wszRealDXGIPath[MAX_PATH];
-        GetSystemDirectoryW(wszRealDXGIPath, MAX_PATH);
-        wcscat_s(wszRealDXGIPath, MAX_PATH, L"\\dxgi.dll");
-#if WITH_MAIN_PATCHER
-        SetupDXGIImportFunctions(LoadLibraryW(wszRealDXGIPath));
-#endif
     }
     if (dwMethod == DLL_INJECTION_METHOD_COM && (bIsThisExplorer || bIsThisStartMEH || bIsThisShellEH))
     {
@@ -14537,15 +14499,8 @@ HRESULT EntryPoint(DWORD dwMethod)
     }
     else if (bIsThisShellEH)
     {
-        if (IsWindows11Version22H2OrHigher())
-        {
-            InjectShellExperienceHostFor22H2OrHigher();
-        }
-        else if (IsWindows11())
-        {
-            InjectShellExperienceHost();
-        }
 #if WITH_MAIN_PATCHER
+        InjectShellExperienceHost();
         if (IsXamlSoundsEnabled())
         {
             HMODULE hWindowsUIXaml = LoadLibraryW(L"Windows.UI.Xaml.dll");
@@ -14570,13 +14525,13 @@ HRESULT EntryPoint(DWORD dwMethod)
 __declspec(dllexport) HRESULT DXGIDeclareAdapterRemovalSupport()
 {
     EntryPoint(DLL_INJECTION_METHOD_DXGI);
-    return DXGIDeclareAdapterRemovalSupportFunc();
+    return DXGIDeclareAdapterRemovalSupportOriginal();
 }
 // for StartMenuExperienceHost.exe via DXGI
 __declspec(dllexport) HRESULT CreateDXGIFactory1(void* p1, void** p2)
 {
     EntryPoint(DLL_INJECTION_METHOD_DXGI);
-    return CreateDXGIFactory1Func(p1, p2);
+    return CreateDXGIFactory1Original(p1, p2);
 }
 // for StartMenuExperienceHost.exe via injection from explorer
 HRESULT InjectStartFromExplorer()

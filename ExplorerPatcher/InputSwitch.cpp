@@ -4,6 +4,8 @@
 #include <wrl/implements.h>
 #include <wil/result_macros.h>
 
+#include "utility.h"
+
 #define TB_POS_NOWHERE 0
 #define TB_POS_BOTTOM 1
 #define TB_POS_TOP 2
@@ -21,7 +23,7 @@ HRESULT CInputSwitchControl_ModifyAnchor(UINT dwNumberOfProfiles, RECT* lpRect)
         return S_FALSE;
     }
 
-    HWND hWndTaskbar = FindWindowW(L"Shell_TrayWnd", NULL);
+    HWND hWndTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
 
     UINT dpiX = 96, dpiY = 96;
     HRESULT hr = GetDpiForMonitor(
@@ -195,4 +197,106 @@ HRESULT CInputSwitchControlProxySV2_CreateInstance(IInputSwitchControlSV2* origi
     Microsoft::WRL::ComPtr<CInputSwitchControlProxySV2> proxy;
     RETURN_IF_FAILED(Microsoft::WRL::MakeAndInitialize<CInputSwitchControlProxySV2>(&proxy, original));
     RETURN_HR(proxy.CopyTo(riid, ppvObject));
+}
+
+BOOL PatchContextMenuOfNewMicrosoftIME(BOOL* bFound)
+{
+    // huge thanks to @Simplestas: https://github.com/valinet/ExplorerPatcher/issues/598
+    HMODULE hInputSwitch = nullptr;
+    if (!GetModuleHandleExW(0, L"InputSwitch.dll", &hInputSwitch))
+        return FALSE;
+
+    PBYTE pInputSwitchText;
+    DWORD cbInputSwitchText;
+    if (!TextSectionBeginAndSize(hInputSwitch, &pInputSwitchText, &cbInputSwitchText))
+        return FALSE;
+
+#if defined(_M_X64)
+    // 44 38 ?? ?? 74 ?? ?? 8B CE E8 ?? ?? ?? ?? 85 C0
+    //             ^^ Change jz into jmp
+    // Ref: CTsfHandler::_OnOopImeContextMenu()
+    PBYTE match = (PBYTE)FindPattern(
+        pInputSwitchText,
+        cbInputSwitchText,
+        "\x44\x38\x00\x00\x74\x00\x00\x8B\xCE\xE8\x00\x00\x00\x00\x85\xC0",
+        "xx??x??xxx????xx"
+    );
+    if (match)
+    {
+        DWORD dwOldProtect;
+        if (VirtualProtect(match + 4, 1, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+        {
+            match[4] = 0xEB;
+            VirtualProtect(match + 4, 1, dwOldProtect, &dwOldProtect);
+            return TRUE;
+        }
+    }
+#elif defined(_M_ARM64)
+    DWORD newInsn = 0;
+
+    // A8 43 40 39 C8 04 00 34 E0 03 ?? AA
+    //             ^^^^^^^^^^^ Change CBZ to B
+    // Ref: CTsfHandler::_OnOopImeContextMenu()
+    PBYTE match = (PBYTE)FindPattern_4_(
+        pInputSwitchText,
+        cbInputSwitchText,
+        "\xA8\x43\x40\x39\xC8\x04\x00\x34\xE0\x03\x00\xAA",
+        "xxxxxxxxxx?x"
+    );
+    if (match)
+    {
+        match += 4;
+        newInsn = ARM64_CBZWToB(*(DWORD*)match);
+    }
+    else
+    {
+        // GetContextMenuResourceId() inlined
+        // MOV W19/W20, #15305
+        // W19: 0b01010010100_0011101111001001_10011 = 52877933 = 33 79 87 52
+        // W20: 0b01010010100_0011101111001001_10100 = 52877934 = 34 79 87 52
+        // P:   0b01010010100_0011101111001001_10??? = 52877930 = 30 79 87 52
+        // M:   0b11111111111_1111111111111111_11000 = FFFFFFF8 = F8 FF FF FF
+        // Ref: CTsfHandler::_OnOopImeContextMenu()
+        match = (PBYTE)FindPatternBitMask_4_(
+            pInputSwitchText,
+            cbInputSwitchText,
+            "\x30\x79\x87\x52",
+            "\xF8\xFF\xFF\xFF",
+            4
+        );
+        if (match)
+        {
+            match += 4; // Point to after the mov
+
+            // We might be a jmp, follow it if so
+            PBYTE pJmpTarget = (PBYTE)ARM64_FollowB((DWORD*)match);
+            if (pJmpTarget)
+            {
+                match = pJmpTarget;
+            }
+
+            if (*(DWORD*)match == 0x52800033)
+            {
+                newInsn = 0x52800013; // MOV W19, #0
+            }
+            else if (*(DWORD*)match == 0x52800034)
+            {
+                newInsn = 0x52800014; // MOV W20, #0
+            }
+        }
+    }
+
+    if (newInsn)
+    {
+        DWORD dwOldProtect;
+        if (VirtualProtect(match, 4, PAGE_EXECUTE_READWRITE, &dwOldProtect))
+        {
+            *(DWORD*)match = newInsn;
+            VirtualProtect(match, 4, dwOldProtect, &dwOldProtect);
+            return TRUE;
+        }
+    }
+#endif
+
+    return FALSE;
 }

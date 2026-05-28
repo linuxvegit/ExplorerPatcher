@@ -2,6 +2,34 @@
 
 This document includes the same release notes as in the [Releases](https://github.com/valinet/ExplorerPatcher/releases) section on GitHub.
 
+## 26100.8457.70
+
+Tested on OS builds 22621.4317, 22631.7079, 26100.6899, 26100.8037, 26200.8246, 26200.8457, 26300.8493, and 28000.2113.
+
+##### 1
+
+* **🚨 Important: Fixed 10 taskbar and 10 Start menu crashing on 26220.8474 (Beta) and 26300.8493 (Experimental).**
+  * Please update EP as soon as possible to ensure future updates run smoothly, otherwise `explorer.exe` will not run with EP's 10 taskbar and `StartMenuExperienceHost.exe` will not run when 10 Start menu is selected.
+  * Those builds have removed remnants of the 10 Start menu in `StartTileData.dll`. Consequently, the 10 Start menu option has been removed on those builds and future builds without the required stuff in the DLL. (bf36cde, 8a5b8ba)
+    * If you want it back, the temporary solution would be to manually swap `C:\Windows\System32\StartTileData.dll` with a version from 26xxx.8457 ([x64](https://msdl.microsoft.com/download/symbols/StartTileData.dll/AFC6C0B854F000/StartTileData.dll); [ARM64](https://msdl.microsoft.com/download/symbols/StartTileData.dll/600B7C42B7D000/StartTileData.dll)). But do not expect this to work for long.
+    * We are confident that this is not the end of the road yet for 10 Start menu. Stay tuned for updates.
+* **Highlight:** Fixed Windows 10 battery flyout crashing on 25951+. (659c2d0)
+  * As a side effect, the network flyout buttons had to be reverted to pre-24H2. Fixes #4691.
+* Changes to "Primary taskbar location on screen" in EP properties now reflect immediately. (6c9b41d)
+* Windows 11 taskbar autohide is no longer modified on Explorer boot. (e6becc9)
+* "Open Start in All apps by default" is now hidden when the new 11 Start menu is enabled. (#4648) (d8f1d1c)
+* Windows 10 Start menu on 21996-22000.51 now no longer crashes. (39ac219)
+* Fixed regedit.exe crashing when switching to thumbnail view in the import/export registry file dialog. (#3940) (80be85d)
+* Updated pattern matching code to support recent builds especially with 26H1 ARM64. (677fd9f, e641e0a, e77123a, 3c8e79f, 854770b, 04dd52b, ce22476, baf0fdb, b532116, c0adee2, eefa0bf, 420e112, 3be4f3f, 1bf0d81, 47d7481, 31d2c23, bdf95c3, fe8cc2b, 1be3c79)
+  * Improved efficiency on ARM64.
+* Added Greek translations. Thanks @KonVetsos!
+
+**ep_taskbar:**
+* Now supports all 43 Windows 11 languages.
+* Fixed reimplementation mistakes in system tray and some other places.
+* [For mod developers] Changed ep_taskbar's DLL names from numbers to the codename of the first major release a single variant supports. (cc36e34)
+* [For mod developers] TrayUI no longer inherits `Microsoft::WRL::RuntimeClass`; vtables are now stable on builds with multiple `ITrayUI` revisions like `ep_taskbar.ge.dll` (formerly `ep_taskbar.5.dll`).
+
 ## 26100.4946.69
 
 Tested on OS builds 26100.4946, 26100.5074, 26200.5751, and 26220.6682.
@@ -43,7 +71,7 @@ Tested on OS builds 26100.4946, 26100.5074, 26200.5751, and 26220.6682.
 ##### 6
 
 * File Explorer: XAML folder views are now disabled when Windows 11 Command Bar is not used. (80414f5)
-  * This fixes crashes when navigating away and returning to Home/Gallery on 22H2/23H2 (#3447), and when opening Home on 26xxx.7019+.
+  * This fixes crashes when navigating away and returning to Home/Gallery on 22H2/23H2 (#3447), and when opening Home on 26xxx.7015+.
 * File Explorer: Fixed Alt+D not working on builds with modern (XAML) navigation bar in File Explorer. (#2847) (a80d9dc)
 * File Explorer: Mitigated breakages on builds with tabs in File Explorer: (75178ec, df7d604)
   * Fixed menu bar behavior when Windows 7 Command Bar is used. Pressing Alt will now summon the menu bar immediately like it used to. (#2676)
@@ -51,10 +79,6 @@ Tested on OS builds 26100.4946, 26100.5074, 26200.5751, and 26220.6682.
 * Taskbar10: These settings now take effect on ep_taskbar: (#4097) (48e1de3)
   * Pinned items act as quick launch (don't group with active apps)
   * When the taskbar shows button labels, remove the extra gap around pinned items
-
-Known issues we will address in the short term:
-* Changing weather icon pack to "Microsoft" has no effect.
-* On Nickel (Windows 11 22H2/23H2), when the new Windows 11 Start menu is enabled, using Windows 10 or Windows 10 (ExplorerPatcher) taskbar will crashloop explorer.exe.
 
 ## 22631.5335.68
 

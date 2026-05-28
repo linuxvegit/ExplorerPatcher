@@ -7,7 +7,6 @@
 #include <winrt/windows.foundation.collections.h>
 #include <winrt/windows.system.h>
 #include <wil/winrt.h>
-#pragma comment(lib, "Psapi.lib")
 
 using namespace Microsoft::WRL;
 
@@ -537,11 +536,6 @@ namespace ABI::WindowsInternal::Shell::UnifiedTile::CuratedTileCollections
         TilePinSize_Tile4x2 = 1,
     };
 
-    namespace DataStoreCache::CuratedTileCollectionTransformer
-    {
-        class CuratedTile;
-    }
-
     MIDL_INTERFACE("354cba6d-19ab-490c-97b6-8d4d9862e052")
     ICuratedTileGroup : public IInspectable
     {
@@ -586,10 +580,6 @@ namespace ABI::WindowsInternal::Shell::UnifiedTile::CuratedTileCollections
         virtual HRESULT STDMETHODCALLTYPE HasCustomProperty(const HSTRING, BOOLEAN*) = 0;
         virtual HRESULT STDMETHODCALLTYPE RemoveCustomProperty(const HSTRING) = 0;
         virtual HRESULT STDMETHODCALLTYPE SetCustomProperty(const HSTRING, HSTRING) = 0;
-        virtual HRESULT STDMETHODCALLTYPE EnsureTileRegistration() = 0;
-        virtual HRESULT STDMETHODCALLTYPE ResurrectTile(std::shared_ptr<DataStoreCache::CuratedTileCollectionTransformer::CuratedTile>, const GUID&) = 0;
-        virtual HRESULT STDMETHODCALLTYPE OnTileAddedWithinCollection(IUnifiedTileIdentifier*) = 0;
-        virtual HRESULT STDMETHODCALLTYPE OnTileRemovedWithinCollection(IUnifiedTileIdentifier*) = 0;
     };
 
     MIDL_INTERFACE("adbf8965-6056-4126-ab26-6660af4661ce")
@@ -1174,19 +1164,20 @@ HRESULT WindowsInternal__Shell__UnifiedTile__Private__UnifiedTilePinUnpinVerbPro
 
 HRESULT PatchUnifiedTilePinUnpinProvider(HMODULE hModule)
 {
-    MODULEINFO mi;
-    RETURN_IF_WIN32_BOOL_FALSE(GetModuleInformation(GetCurrentProcess(), hModule, &mi, sizeof(mi)));
+    PBYTE pText;
+    DWORD cbText;
+    RETURN_HR_IF(E_NOT_SET, !TextSectionBeginAndSize(hModule, &pText, &cbText));
 
 #if defined(_M_X64)
     PBYTE match;
-    SIZE_T offset = (SIZE_T)hModule;
+    SIZE_T offset = (SIZE_T)pText;
     while (true)
     {
         // 48 89 ?? 24 ?? 4C 8B ?? 4C 8B 44 24 ?? 49 8B ?? ?? 8B ?? E8 ?? ?? ?? ??
         //                                                             ^^^^^^^^^^^
         match = (PBYTE)FindPattern(
             (PVOID)offset,
-            mi.SizeOfImage - (DWORD)(offset - (SIZE_T)hModule),
+            cbText - (DWORD)(offset - (SIZE_T)pText),
             "\x48\x89\x00\x24\x00\x4C\x8B\x00\x4C\x8B\x44\x24\x00\x49\x8B\x00\x00\x8B\x00\xE8",
             "xx?x?xx?xxxx?xx??x?x"
         );
@@ -1218,19 +1209,36 @@ HRESULT PatchUnifiedTilePinUnpinProvider(HMODULE hModule)
         }
     }
 #elif defined(_M_ARM64)
-    // E4 06 40 F9 E3 03 15 AA E2 0E 40 F9 E1 03 19 AA E0 03 16 AA ?? ?? ?? ?? E3 03 00 2A
+    // ?? ?? 40 F9 E3 03 15 AA ?? ?? 40 F9 E1 03 ?? AA E0 03 ?? AA ?? ?? ?? ?? E3 03 00 2A // NI, GE
     //                                                             ^^^^^^^^^^^
     // Ref: WindowsInternal::Shell::UnifiedTile::Private::UnifiedTilePinUnpinVerbProvider::GetVerbs()
-    PBYTE match = (PBYTE)FindPattern(
-        hModule,
-        mi.SizeOfImage,
-        "\xE4\x06\x40\xF9\xE3\x03\x15\xAA\xE2\x0E\x40\xF9\xE1\x03\x19\xAA\xE0\x03\x16\xAA\x00\x00\x00\x00\xE3\x03\x00\x2A",
-        "xxxxxxxxxxxxxxxxxxxx????xxxx"
+    PBYTE match = (PBYTE)FindPattern_4_(
+        pText + 2,
+        cbText - 2,
+        "\x40\xF9\xE3\x03\x15\xAA\x00\x00\x40\xF9\xE1\x03\x00\xAA\xE0\x03\x00\xAA\x00\x00\x00\x00\xE3\x03\x00\x2A",
+        "xxxxxx??xxxx?xxx?x????xxxx"
     );
     if (match)
     {
-        match += 20;
+        match += 18;
         match = (PBYTE)ARM64_FollowBL((DWORD*)match);
+    }
+    else
+    {
+        // E4 8A 40 A9 E3 03 ?? AA E1 03 ?? AA E0 03 ?? AA ?? ?? ?? ?? ?? ?? ?? F9 E3 03 00 2A // BR
+        //                                                 ^^^^^^^^^^^
+        // Ref: WindowsInternal::Shell::UnifiedTile::Private::UnifiedTilePinUnpinVerbProvider::GetVerbs()
+        match = (PBYTE)FindPattern_4_(
+            pText,
+            cbText,
+            "\xE4\x8A\x40\xA9\xE3\x03\x00\xAA\xE1\x03\x00\xAA\xE0\x03\x00\xAA\x00\x00\x00\x00\x00\x00\x00\xF9\xE3\x03\x00\x2A",
+            "xxxxxx?xxx?xxx?x???????xxxxx"
+        );
+        if (match)
+        {
+            match += 16;
+            match = (PBYTE)ARM64_FollowBL((DWORD*)match);
+        }
     }
 #endif
 
@@ -1289,6 +1297,13 @@ HRESULT AppResolver_CAppResolverCacheBuilder__AddUserPinnedShortcutToStart(void*
 
     if (!dwStartShowClassicMode)
         return AppResolver_CAppResolverCacheBuilder__AddUserPinnedShortcutToStartFunc(_this, a2, a3);
+
+    // UnifiedTileIdentifier^ tileIdentifier = UnifiedTileIdentifier::Create(a2->GetAppID(a3));
+    // StartTilePinnedShortcutsManager::CreateUserPinnedShortcutTile(tileIdentifier);
+    // CuratedTileCollectionManager^ tileCollectionManager = ref new CuratedTileCollectionManager();
+    // CuratedTileCollection^ tileCollection = tileCollectionManager->GetCollection(L"Start.TileGrid");
+    // tileCollection->PinToStart(tileIdentifier, TilePinSize::Tile2x2);
+    // tileCollection->Commit();
 
     ComPtr<IWin32UnifiedTileIdentifierFactory> pTileIdentifierFactory;
     RETURN_IF_FAILED(Windows::Foundation::GetActivationFactory(

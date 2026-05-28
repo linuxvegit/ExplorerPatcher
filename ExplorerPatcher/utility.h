@@ -142,7 +142,7 @@ __declspec(dllexport) int CALLBACK ZZRestartExplorer(HWND hWnd, HINSTANCE hInsta
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 
-typedef LSTATUS(*t_SHRegGetValueFromHKCUHKLM)(
+typedef LSTATUS (*SHRegGetValueFromHKCUHKLM_t)(
     PCWSTR pwszKey,
     PCWSTR pwszValue,
     int/*SRRF*/ srrfFlags,
@@ -150,7 +150,10 @@ typedef LSTATUS(*t_SHRegGetValueFromHKCUHKLM)(
     void* pvData,
     DWORD* pcbData
 );
-EP_INLINE t_SHRegGetValueFromHKCUHKLM SHRegGetValueFromHKCUHKLMFunc;
+EP_INLINE SHRegGetValueFromHKCUHKLM_t SHRegGetValueFromHKCUHKLMFunc;
+
+typedef BOOL (*SHRegGetBoolValueFromHKCUHKLM_t)(PCWSTR pszKey, PCWSTR pszValue, BOOL fDefault);
+EP_INLINE SHRegGetBoolValueFromHKCUHKLM_t SHRegGetBoolValueFromHKCUHKLMFunc;
 
 inline LSTATUS SHRegGetValueFromHKCUHKLMWithOpt(
     PCWSTR pwszKey,
@@ -605,7 +608,72 @@ inline BOOL IncrementDLLReferenceCount(HINSTANCE hinst)
     return TRUE;
 }
 
-inline void SectionBeginAndSize(HMODULE hModule, const char* pszSectionName, PBYTE* beginSection, DWORD* sizeSection)
+inline void REPLACE_VTABLE_ENTRY_Helper(void** vtable, int index, void* hookFunc, void** originalFunc)
+{
+    void** ppfn = &vtable[index];
+    if (*ppfn != hookFunc)
+    {
+        *originalFunc = *ppfn;
+        DWORD dwOldProtect;
+        if (VirtualProtect(ppfn, sizeof(void*), PAGE_EXECUTE_READWRITE, &dwOldProtect))
+        {
+            *ppfn = hookFunc;
+            VirtualProtect(ppfn, sizeof(void*), dwOldProtect, &dwOldProtect);
+        }
+    }
+}
+
+// Before using this, please make sure that the vtable is in the real module not a stub.
+#define REPLACE_VTABLE_ENTRY(vtable, index, name) \
+    REPLACE_VTABLE_ENTRY_Helper(vtable, index, (void*)name##Hook, (void**)&name##Func)
+
+UINT_PTR RVAToFileOffset(PBYTE pBase, UINT_PTR rva);
+
+inline BOOL SectionBeginAndSizeEx64(
+    const IMAGE_DOS_HEADER* dosHeader, const IMAGE_NT_HEADERS64* ntHeader, const char* pszSectionName,
+    PBYTE* beginSection, DWORD* sizeSection)
+{
+    *beginSection = NULL;
+    *sizeSection = 0;
+
+    PIMAGE_SECTION_HEADER firstSection = IMAGE_FIRST_SECTION(ntHeader);
+    for (unsigned int i = 0; i < ntHeader->FileHeader.NumberOfSections; ++i)
+    {
+        PIMAGE_SECTION_HEADER section = firstSection + i;
+        if (strncmp((const char*)section->Name, pszSectionName, IMAGE_SIZEOF_SHORT_NAME) == 0)
+        {
+            *beginSection = (PBYTE)dosHeader + section->VirtualAddress;
+            *sizeSection = section->Misc.VirtualSize;
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+inline BOOL SectionBeginAndSizePEFileEx64(
+    const IMAGE_DOS_HEADER* dosHeader, const IMAGE_NT_HEADERS64* ntHeader, const char* pszSectionName,
+    PBYTE* beginSection, DWORD* sizeSection)
+{
+    *beginSection = NULL;
+    *sizeSection = 0;
+
+    PIMAGE_SECTION_HEADER firstSection = IMAGE_FIRST_SECTION(ntHeader);
+    for (unsigned int i = 0; i < ntHeader->FileHeader.NumberOfSections; ++i)
+    {
+        PIMAGE_SECTION_HEADER section = firstSection + i;
+        if (strncmp((const char*)section->Name, pszSectionName, IMAGE_SIZEOF_SHORT_NAME) == 0)
+        {
+            *beginSection = (PBYTE)dosHeader + section->PointerToRawData;
+            *sizeSection = section->SizeOfRawData;
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+inline BOOL SectionBeginAndSize(HMODULE hModule, const char* pszSectionName, PBYTE* beginSection, DWORD* sizeSection)
 {
     *beginSection = NULL;
     *sizeSection = 0;
@@ -614,34 +682,306 @@ inline void SectionBeginAndSize(HMODULE hModule, const char* pszSectionName, PBY
     if (dosHeader->e_magic == IMAGE_DOS_SIGNATURE)
     {
         PIMAGE_NT_HEADERS64 ntHeader = (PIMAGE_NT_HEADERS64)((BYTE*)dosHeader + dosHeader->e_lfanew);
-        if (ntHeader->Signature == IMAGE_NT_SIGNATURE)
+        if (ntHeader->Signature == IMAGE_NT_SIGNATURE && ntHeader->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
         {
-            PIMAGE_SECTION_HEADER firstSection = IMAGE_FIRST_SECTION(ntHeader);
-            for (unsigned int i = 0; i < ntHeader->FileHeader.NumberOfSections; ++i)
-            {
-                PIMAGE_SECTION_HEADER section = firstSection + i;
-                if (strncmp((const char*)section->Name, pszSectionName, IMAGE_SIZEOF_SHORT_NAME) == 0)
-                {
-                    *beginSection = (PBYTE)dosHeader + section->VirtualAddress;
-                    *sizeSection = section->SizeOfRawData;
-                    break;
-                }
-            }
+            return SectionBeginAndSizeEx64(dosHeader, ntHeader, pszSectionName, beginSection, sizeSection);
         }
     }
+
+    return FALSE;
 }
 
-__forceinline void TextSectionBeginAndSize(HMODULE hModule, PBYTE* beginSection, DWORD* sizeSection)
+inline BOOL SectionBeginAndSizePEFile(
+    PBYTE pFileBase, DWORD fileSize, const char* pszSectionName, PBYTE* beginSection, DWORD* sizeSection)
 {
-    SectionBeginAndSize(hModule, ".text", beginSection, sizeSection);
+    *beginSection = NULL;
+    *sizeSection = 0;
+
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)pFileBase;
+    if (dosHeader->e_magic == IMAGE_DOS_SIGNATURE)
+    {
+        PIMAGE_NT_HEADERS64 ntHeader = (PIMAGE_NT_HEADERS64)(pFileBase + dosHeader->e_lfanew);
+        if (ntHeader->Signature == IMAGE_NT_SIGNATURE && ntHeader->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        {
+            return SectionBeginAndSizePEFileEx64(dosHeader, ntHeader, pszSectionName, beginSection, sizeSection);
+        }
+    }
+
+    return FALSE;
 }
 
-__forceinline void RDataSectionBeginAndSize(HMODULE hModule, PBYTE* beginSection, DWORD* sizeSection)
+typedef struct _EP_IMAGE_CHPE_RANGE_ENTRY
 {
-    SectionBeginAndSize(hModule, ".rdata", beginSection, sizeSection);
+    union
+    {
+        ULONG StartOffset;
+        struct
+        {
+            ULONG NativeCode : 1;
+            ULONG AddressBits : 31;
+        } DUMMYSTRUCTNAME;
+    } DUMMYUNIONNAME;
+    ULONG Length;
+} EP_IMAGE_CHPE_RANGE_ENTRY, *PEP_IMAGE_CHPE_RANGE_ENTRY;
+
+typedef struct _EP_IMAGE_ARM64EC_METADATA
+{
+    ULONG  Version;
+    ULONG  CodeMap;
+    ULONG  CodeMapCount;
+    ULONG  CodeRangesToEntryPoints;
+    ULONG  RedirectionMetadata;
+    ULONG  __os_arm64x_dispatch_call_no_redirect;
+    ULONG  __os_arm64x_dispatch_ret;
+    ULONG  __os_arm64x_dispatch_call;
+    ULONG  __os_arm64x_dispatch_icall;
+    ULONG  __os_arm64x_dispatch_icall_cfg;
+    ULONG  AlternateEntryPoint;
+    ULONG  AuxiliaryIAT;
+    ULONG  CodeRangesToEntryPointsCount;
+    ULONG  RedirectionMetadataCount;
+    ULONG  GetX64InformationFunctionPointer;
+    ULONG  SetX64InformationFunctionPointer;
+    ULONG  ExtraRFETable;
+    ULONG  ExtraRFETableSize;
+    ULONG  __os_arm64x_dispatch_fptr;
+    ULONG  AuxiliaryIATCopy;
+} EP_IMAGE_ARM64EC_METADATA;
+
+// https://github.com/ramensoftware/windhawk/blob/03963d65e7077b761e5295defc2ccd5378e650a2/src/windhawk/engine/symbol_enum.cpp#L251
+inline BOOL GetChpeRanges64(
+    const IMAGE_DOS_HEADER* dosHeader, const IMAGE_NT_HEADERS64* ntHeader,
+    const EP_IMAGE_CHPE_RANGE_ENTRY** prgRanges, ULONG* pcRanges)
+{
+    *prgRanges = NULL;
+    *pcRanges = 0;
+    const IMAGE_OPTIONAL_HEADER64* opt = &ntHeader->OptionalHeader;
+
+    if (opt->NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG
+        || !opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress)
+    {
+        return FALSE;
+    }
+
+    DWORD directorySize = opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size;
+
+    const IMAGE_LOAD_CONFIG_DIRECTORY64* cfg = (const IMAGE_LOAD_CONFIG_DIRECTORY64*)(
+        (const char*)dosHeader + opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress);
+
+    const DWORD kMinSize = offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, CHPEMetadataPointer)
+        + sizeof(ULONGLONG);
+
+    if (directorySize < kMinSize || cfg->Size < kMinSize)
+    {
+        return FALSE;
+    }
+
+    if (!cfg->CHPEMetadataPointer)
+    {
+        return FALSE;
+    }
+
+    // Either IMAGE_CHPE_METADATA_X86 or EP_IMAGE_ARM64EC_METADATA.
+    const EP_IMAGE_ARM64EC_METADATA* metadata = (const EP_IMAGE_ARM64EC_METADATA*)(
+        (const char*)dosHeader + cfg->CHPEMetadataPointer - opt->ImageBase);
+
+    const EP_IMAGE_CHPE_RANGE_ENTRY* codeMap = (const EP_IMAGE_CHPE_RANGE_ENTRY*)(
+        (const char*)dosHeader + metadata->CodeMap);
+
+    *prgRanges = codeMap;
+    *pcRanges = metadata->CodeMapCount;
+    return TRUE;
 }
 
-PVOID FindPattern(PVOID pBase, SIZE_T dwSize, LPCSTR lpPattern, LPCSTR lpMask);
+inline BOOL GetChpeRangesPEFile64(
+    DWORD fileSize,
+    const IMAGE_DOS_HEADER* dosHeader, const IMAGE_NT_HEADERS64* ntHeader,
+    const EP_IMAGE_CHPE_RANGE_ENTRY** prgRanges, ULONG* pcRanges)
+{
+    *prgRanges = NULL;
+    *pcRanges = 0;
+    const IMAGE_OPTIONAL_HEADER64* opt = &ntHeader->OptionalHeader;
+
+    if (opt->NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG
+        || !opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress)
+    {
+        return FALSE;
+    }
+
+    DWORD directorySize = opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size;
+
+    UINT_PTR directoryOffset = RVAToFileOffset((PBYTE)dosHeader, opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress);
+    if (!directoryOffset || directoryOffset + sizeof(IMAGE_LOAD_CONFIG_DIRECTORY64) > fileSize)
+    {
+        return FALSE;
+    }
+
+    const IMAGE_LOAD_CONFIG_DIRECTORY64* cfg = (const IMAGE_LOAD_CONFIG_DIRECTORY64*)(
+        (const char*)dosHeader + directoryOffset);
+
+    const DWORD kMinSize = offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, CHPEMetadataPointer)
+        + sizeof(ULONGLONG);
+
+    if (directorySize < kMinSize || cfg->Size < kMinSize)
+    {
+        return FALSE;
+    }
+
+    if (!cfg->CHPEMetadataPointer)
+    {
+        return FALSE;
+    }
+
+    UINT_PTR metadataOffset = RVAToFileOffset((PBYTE)dosHeader, cfg->CHPEMetadataPointer - opt->ImageBase);
+    if (!metadataOffset || metadataOffset + sizeof(EP_IMAGE_ARM64EC_METADATA) > fileSize)
+    {
+        return FALSE;
+    }
+
+    // Either IMAGE_CHPE_METADATA_X86 or EP_IMAGE_ARM64EC_METADATA.
+    const EP_IMAGE_ARM64EC_METADATA* metadata = (const EP_IMAGE_ARM64EC_METADATA*)(
+        (const char*)dosHeader + metadataOffset);
+
+    UINT_PTR codeMapOffset = RVAToFileOffset((PBYTE)dosHeader, metadata->CodeMap);
+    if (!codeMapOffset || codeMapOffset + sizeof(EP_IMAGE_CHPE_RANGE_ENTRY) * metadata->CodeMapCount > fileSize)
+    {
+        return FALSE;
+    }
+
+    const EP_IMAGE_CHPE_RANGE_ENTRY* codeMap = (const EP_IMAGE_CHPE_RANGE_ENTRY*)(
+        (const char*)dosHeader + codeMapOffset);
+
+    *prgRanges = codeMap;
+    *pcRanges = metadata->CodeMapCount;
+    return TRUE;
+}
+
+typedef enum _EP_ChpeCodeRangeType
+{
+    CODERANGE_Arm64,
+    CODERANGE_Arm64EC,
+    CODERANGE_Amd64,
+} EP_ChpeCodeRangeType;
+
+#if defined(_M_ARM64) || defined(_M_ARM64EC)
+inline BOOL TextSectionBeginAndSize(HMODULE hModule, PBYTE* beginSection, DWORD* sizeSection)
+{
+    *beginSection = NULL;
+    *sizeSection = 0;
+
+#if defined(_M_ARM64)
+    const EP_ChpeCodeRangeType appropriateCodeRangeType = CODERANGE_Arm64;
+#elif defined(_M_ARM64EC)
+    const EP_ChpeCodeRangeType appropriateCodeRangeType = CODERANGE_Arm64EC;
+#endif
+
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hModule;
+    if (dosHeader->e_magic == IMAGE_DOS_SIGNATURE)
+    {
+        PIMAGE_NT_HEADERS64 ntHeader = (PIMAGE_NT_HEADERS64)((BYTE*)dosHeader + dosHeader->e_lfanew);
+        if (ntHeader->Signature == IMAGE_NT_SIGNATURE && ntHeader->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        {
+            if (!SectionBeginAndSizeEx64(dosHeader, ntHeader, ".text", beginSection, sizeSection))
+                return FALSE;
+
+            // Narrow down the results to the appropriate code range on Arm64X binaries
+            const EP_IMAGE_CHPE_RANGE_ENTRY* rgRanges;
+            ULONG cRanges;
+            if (GetChpeRanges64(dosHeader, ntHeader, &rgRanges, &cRanges))
+            {
+                const EP_IMAGE_CHPE_RANGE_ENTRY* pLast = rgRanges + cRanges;
+                for (const EP_IMAGE_CHPE_RANGE_ENTRY* pCurrent = rgRanges; pCurrent < pLast; ++pCurrent)
+                {
+                    const ULONG typeMask = 3; // 1 for 32 bit
+                    ULONG start = pCurrent->StartOffset & ~typeMask; // RVA
+                    EP_ChpeCodeRangeType type = (EP_ChpeCodeRangeType)(pCurrent->StartOffset & typeMask);
+                    if (type == appropriateCodeRangeType)
+                    {
+                        *beginSection = (PBYTE)hModule + start;
+                        *sizeSection = pCurrent->Length;
+                        break;
+                    }
+                }
+            }
+
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+inline BOOL TextSectionBeginAndSizePEFile(PBYTE pFileBase, DWORD fileSize, PBYTE* beginSection, DWORD* sizeSection)
+{
+    *beginSection = NULL;
+    *sizeSection = 0;
+
+#if defined(_M_ARM64)
+    const EP_ChpeCodeRangeType appropriateCodeRangeType = CODERANGE_Arm64;
+#elif defined(_M_ARM64EC)
+    const EP_ChpeCodeRangeType appropriateCodeRangeType = CODERANGE_Arm64EC;
+#endif
+
+    PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)pFileBase;
+    if (dosHeader->e_magic == IMAGE_DOS_SIGNATURE)
+    {
+        PIMAGE_NT_HEADERS64 ntHeader = (PIMAGE_NT_HEADERS64)(pFileBase + dosHeader->e_lfanew);
+        if (ntHeader->Signature == IMAGE_NT_SIGNATURE && ntHeader->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        {
+            if (!SectionBeginAndSizePEFileEx64(dosHeader, ntHeader, ".text", beginSection, sizeSection))
+                return FALSE;
+
+            // Narrow down the results to the appropriate code range on Arm64X binaries
+            const EP_IMAGE_CHPE_RANGE_ENTRY* rgRanges;
+            ULONG cRanges;
+            if (GetChpeRangesPEFile64(fileSize, dosHeader, ntHeader, &rgRanges, &cRanges))
+            {
+                const EP_IMAGE_CHPE_RANGE_ENTRY* pLast = rgRanges + cRanges;
+                for (const EP_IMAGE_CHPE_RANGE_ENTRY* pCurrent = rgRanges; pCurrent < pLast; ++pCurrent)
+                {
+                    const ULONG typeMask = 3; // 1 for 32 bit
+                    ULONG start = pCurrent->StartOffset & ~typeMask; // RVA
+                    EP_ChpeCodeRangeType type = (EP_ChpeCodeRangeType)(pCurrent->StartOffset & typeMask);
+                    if (type == appropriateCodeRangeType)
+                    {
+                        UINT_PTR offset = RVAToFileOffset(pFileBase, start);
+                        if (offset && offset + pCurrent->Length <= fileSize)
+                        {
+                            *beginSection = (PBYTE)pFileBase + offset;
+                            *sizeSection = pCurrent->Length;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+#else
+__forceinline BOOL TextSectionBeginAndSize(HMODULE hModule, PBYTE* beginSection, DWORD* sizeSection)
+{
+    return SectionBeginAndSize(hModule, ".text", beginSection, sizeSection);
+}
+
+__forceinline BOOL TextSectionBeginAndSizePEFile(PBYTE pFileBase, DWORD fileSize, PBYTE* beginSection, DWORD* sizeSection)
+{
+    return SectionBeginAndSizePEFile(pFileBase, fileSize, ".text", beginSection, sizeSection);
+}
+#endif
+
+__forceinline BOOL RDataSectionBeginAndSize(HMODULE hModule, PBYTE* beginSection, DWORD* sizeSection)
+{
+    return SectionBeginAndSize(hModule, ".rdata", beginSection, sizeSection);
+}
+
+__forceinline BOOL RDataSectionBeginAndSizePEFile(PBYTE pFileBase, DWORD fileSize, PBYTE* beginSection, DWORD* sizeSection)
+{
+    return SectionBeginAndSizePEFile(pFileBase, fileSize, ".rdata", beginSection, sizeSection);
+}
 
 #if _M_X64
 inline BOOL FollowJump(PBYTE pInstr, BYTE shortOpcode, BYTE longOpcodeExt, DWORD* pInstrSize, PBYTE* pTarget)
@@ -671,6 +1011,25 @@ inline BOOL FollowJnz(PBYTE pInstr, PBYTE* pTarget, DWORD* pInstrSize)
 inline BOOL FollowJz(PBYTE pInstr, PBYTE* pTarget, DWORD* pInstrSize)
 {
     return FollowJump(pInstr, 0x74, 0x84, pInstrSize, pTarget);
+}
+
+inline BOOL FollowJmp(PBYTE pInstr, PBYTE* pTarget, DWORD* pInstrSize)
+{
+    // Check long
+    if (pInstr[0] == 0xE9)
+    {
+        *pTarget = pInstr + 5 + *(int*)(pInstr + 1);
+        *pInstrSize = 5;
+        return TRUE;
+    }
+    // Check short
+    if (pInstr[0] == 0xEB)
+    {
+        *pTarget = pInstr + 2 + *(char*)(pInstr + 1);
+        *pInstrSize = 2;
+        return TRUE;
+    }
+    return FALSE;
 }
 #endif
 
@@ -711,6 +1070,7 @@ __forceinline BOOL ARM64_IsCBZW(DWORD insn) { return ARM64_ReadBits(insn, 31, 24
 __forceinline BOOL ARM64_IsCBNZW(DWORD insn) { return ARM64_ReadBits(insn, 31, 24) == 0b00110101; }
 __forceinline BOOL ARM64_IsTBZ(DWORD insn) { return ARM64_ReadBits(insn, 31, 24) == 0b00110110; }
 __forceinline BOOL ARM64_IsTBNZ(DWORD insn) { return ARM64_ReadBits(insn, 31, 24) == 0b00110111; }
+__forceinline BOOL ARM64_IsB(DWORD insn) { return ARM64_ReadBits(insn, 31, 26) == 0b000101; }
 __forceinline BOOL ARM64_IsBL(DWORD insn) { return ARM64_ReadBits(insn, 31, 26) == 0b100101; }
 __forceinline BOOL ARM64_IsADRP(DWORD insn) { return (ARM64_ReadBits(insn, 31, 24) & ~0b01100000) == 0b10010000; }
 __forceinline BOOL ARM64_IsMOVZW(DWORD insn) { return ARM64_ReadBits(insn, 31, 23) == 0b010100101; }
@@ -723,6 +1083,15 @@ __forceinline DWORD* ARM64_FollowCBNZW(DWORD* pInsnCBNZW)
         return NULL;
     int imm19 = ARM64_ReadBitsSignExtend(insnCBNZW, 23, 5);
     return pInsnCBNZW + imm19; // offset = imm19 * 4
+}
+
+__forceinline DWORD* ARM64_FollowB(DWORD* pInsnB)
+{
+    DWORD insnB = *pInsnB;
+    if (!ARM64_IsB(insnB))
+        return NULL;
+    int imm26 = ARM64_ReadBitsSignExtend(insnB, 25, 0);
+    return pInsnB + imm26; // offset = imm26 * 4
 }
 
 __forceinline DWORD* ARM64_FollowBL(DWORD* pInsnBL)
@@ -739,6 +1108,13 @@ __forceinline DWORD ARM64_MakeB(int imm26)
     if (!ARM64_IsInRange(imm26, 26))
         return 0;
     return 0b000101 << 26 | imm26 & (1 << 26) - 1;
+}
+
+__forceinline DWORD ARM64_MakeBL(int imm26)
+{
+    if (!ARM64_IsInRange(imm26, 26))
+        return 0;
+    return 0b100101 << 26 | imm26 & (1 << 26) - 1;
 }
 
 __forceinline DWORD ARM64_CBZWToB(DWORD insnCBZW)
@@ -796,6 +1172,14 @@ __forceinline DWORD ARM64_DecodeLDRBIMM(DWORD insnLDRBIMM)
     return imm12;
 }
 
+__forceinline DWORD ARM64_DecodeLDRIMMW(DWORD insnLDRIMMW)
+{
+    if (ARM64_ReadBits(insnLDRIMMW, 31, 22) != 0b1011100101)
+        return (DWORD)-1;
+    DWORD imm12 = ARM64_ReadBits(insnLDRIMMW, 21, 10);
+    return imm12;
+}
+
 inline UINT_PTR ARM64_DecodeADRL(UINT_PTR offset, DWORD insnADRP, DWORD insnADD)
 {
     if (!ARM64_IsADRP(insnADRP))
@@ -810,69 +1194,6 @@ inline UINT_PTR ARM64_DecodeADRL(UINT_PTR offset, DWORD insnADRP, DWORD insnADD)
     DWORD add_imm = ARM64_DecodeADD(insnADD);
 
     return page + adrp_imm + add_imm;
-}
-#endif
-
-#if defined(WITH_MAIN_PATCHER) && WITH_MAIN_PATCHER
-inline BOOL WINAPI PatchContextMenuOfNewMicrosoftIME(BOOL* bFound)
-{
-    // huge thanks to @Simplestas: https://github.com/valinet/ExplorerPatcher/issues/598
-    HMODULE hInputSwitch = NULL;
-    if (!GetModuleHandleExW(0, L"InputSwitch.dll", &hInputSwitch))
-        return FALSE;
-
-    MODULEINFO mi;
-    GetModuleInformation(GetCurrentProcess(), hInputSwitch, &mi, sizeof(mi));
-
-#if defined(_M_X64)
-    // 44 38 ?? ?? 74 ?? ?? 8B CE E8 ?? ?? ?? ?? 85 C0
-    //             ^^ Change jz into jmp
-    PBYTE match = (PBYTE)FindPattern(
-        hInputSwitch,
-        mi.SizeOfImage,
-        "\x44\x38\x00\x00\x74\x00\x00\x8B\xCE\xE8\x00\x00\x00\x00\x85\xC0",
-        "xx??x??xxx????xx"
-    );
-    if (!match)
-        return FALSE;
-
-    DWORD dwOldProtect;
-    if (!VirtualProtect(match + 4, 1, PAGE_EXECUTE_READWRITE, &dwOldProtect))
-        return FALSE;
-
-    match[4] = 0xEB;
-
-    VirtualProtect(match + 4, 1, dwOldProtect, &dwOldProtect);
-
-    return TRUE;
-#elif defined(_M_ARM64)
-    // A8 43 40 39 C8 04 00 34 E0 03 14 AA
-    //             ^^^^^^^^^^^ Change CBZ to B
-    PBYTE match = (PBYTE)FindPattern(
-        hInputSwitch,
-        mi.SizeOfImage,
-        "\xA8\x43\x40\x39\xC8\x04\x00\x34\xE0\x03\x14\xAA",
-        "xxxxxxxxxxxx"
-    );
-    if (!match)
-        return FALSE;
-
-    match += 4;
-
-    DWORD newInsn = ARM64_CBZWToB(*(DWORD*)match);
-    if (!newInsn)
-        return FALSE;
-
-    DWORD dwOldProtect;
-    if (!VirtualProtect(match, 4, PAGE_EXECUTE_READWRITE, &dwOldProtect))
-        return FALSE;
-
-    *(DWORD*)match = newInsn;
-
-    VirtualProtect(match, 4, dwOldProtect, &dwOldProtect);
-
-    return TRUE;
-#endif
 }
 #endif
 
@@ -925,41 +1246,118 @@ typedef struct _MonitorOverrideData
 BOOL ExtractMonitorByIndex(HMONITOR hMonitor, HDC hDC, LPRECT lpRect, MonitorOverrideData* mod);
 HRESULT SHRegGetBOOLWithREGSAM(HKEY key, LPCWSTR subKey, LPCWSTR value, REGSAM regSam, BOOL* data);
 HRESULT SHRegGetDWORD(HKEY hkey, const WCHAR* pwszSubKey, const WCHAR* pwszValue, DWORD* pdwData);
+VS_FIXEDFILEINFO* GetModuleVersionInfo(HMODULE hModule, UINT* puPtrLen);
+BOOL IsOsFeatureEnabled(UINT featureId, BOOL bEnabledByDefault);
+BOOL IsRedesignedWin11StartMenu();
 
-inline BOOL MaskCompare(PVOID pBuffer, LPCSTR lpPattern, LPCSTR lpMask)
+FORCEINLINE BOOL _MaskCompareByteLevel(PVOID pvSearch, LPCSTR pszPattern, LPCSTR pszMask)
 {
-    for (PBYTE value = (PBYTE)pBuffer; *lpMask; ++lpPattern, ++lpMask, ++value)
+    for (PBYTE value = (PBYTE)pvSearch; *pszMask; ++pszPattern, ++pszMask, ++value)
     {
-        if (*lpMask == 'x' && *(LPCBYTE)lpPattern != *value)
+        if (*pszMask == 'x' && *(LPCBYTE)pszPattern != *value)
             return FALSE;
     }
 
     return TRUE;
 }
 
-inline __declspec(noinline) PVOID FindPatternHelper(PVOID pBase, SIZE_T dwSize, LPCSTR lpPattern, LPCSTR lpMask)
+inline DECLSPEC_NOINLINE PVOID _FindPatternHelper_1_(PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask)
 {
-    for (SIZE_T index = 0; index < dwSize; ++index)
+    PBYTE pBegin = (PBYTE)pvSearch;
+    PBYTE pEnd = pBegin + cbSearch;
+    for (PBYTE pIt = pBegin; pIt <= pEnd; pIt += 1)
     {
-        PBYTE pAddress = (PBYTE)pBase + index;
-
-        if (MaskCompare(pAddress, lpPattern, lpMask))
-            return pAddress;
+        if (_MaskCompareByteLevel(pIt, pszPattern, pszMask))
+            return pIt;
     }
 
     return NULL;
 }
 
-inline PVOID FindPattern(PVOID pBase, SIZE_T dwSize, LPCSTR lpPattern, LPCSTR lpMask)
+inline DECLSPEC_NOINLINE PVOID _FindPatternHelper_4_(PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask)
 {
-    dwSize -= strlen(lpMask);
-    return FindPatternHelper(pBase, dwSize, lpPattern, lpMask);
+    PBYTE pBegin = (PBYTE)pvSearch;
+    PBYTE pEnd = pBegin + cbSearch;
+    for (PBYTE pIt = pBegin; pIt <= pEnd; pIt += 4)
+    {
+        if (_MaskCompareByteLevel(pIt, pszPattern, pszMask))
+            return pIt;
+    }
+
+    return NULL;
+}
+
+FORCEINLINE PVOID FindPattern(PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask)
+{
+    cbSearch -= strlen(pszMask);
+    return _FindPatternHelper_1_(pvSearch, cbSearch, pszPattern, pszMask);
+}
+
+FORCEINLINE PVOID FindPattern_4_(PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask)
+{
+    cbSearch -= strlen(pszMask);
+    return _FindPatternHelper_4_(pvSearch, cbSearch, pszPattern, pszMask);
+}
+
+FORCEINLINE BOOL _MaskCompareBitLevel(PVOID pvSearch, LPCSTR pszPattern, LPCSTR pszMask, size_t cbPattern)
+{
+    PBYTE pBegin = (PBYTE)pvSearch;
+    PBYTE pEnd = pBegin + cbPattern;
+    for (PBYTE pIt = pBegin; pIt < pEnd; ++pIt, ++pszPattern, ++pszMask)
+    {
+        if ((*pIt & *(LPCBYTE)pszMask) != *(LPCBYTE)pszPattern)
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
+inline DECLSPEC_NOINLINE PVOID _FindPatternBitMaskHelper_1_(
+    PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask, size_t cbPattern)
+{
+    PBYTE pBegin = (PBYTE)pvSearch;
+    PBYTE pEnd = pBegin + cbSearch;
+    for (PBYTE pIt = pBegin; pIt <= pEnd; pIt += 1)
+    {
+        if (_MaskCompareBitLevel(pIt, pszPattern, pszMask, cbPattern))
+            return pIt;
+    }
+
+    return NULL;
+}
+
+inline DECLSPEC_NOINLINE PVOID _FindPatternBitMaskHelper_4_(
+    PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask, size_t cbPattern)
+{
+    PBYTE pBegin = (PBYTE)pvSearch;
+    PBYTE pEnd = pBegin + cbSearch;
+    for (PBYTE pIt = pBegin; pIt <= pEnd; pIt += 4)
+    {
+        if (_MaskCompareBitLevel(pIt, pszPattern, pszMask, cbPattern))
+            return pIt;
+    }
+
+    return NULL;
+}
+
+FORCEINLINE PVOID FindPatternBitMask(
+    PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask, size_t cbPattern)
+{
+    cbSearch -= cbPattern;
+    return _FindPatternBitMaskHelper_1_(pvSearch, cbSearch, pszPattern, pszMask, cbPattern);
+}
+
+FORCEINLINE PVOID FindPatternBitMask_4_(
+    PVOID pvSearch, size_t cbSearch, LPCSTR pszPattern, LPCSTR pszMask, size_t cbPattern)
+{
+    cbSearch -= cbPattern;
+    return _FindPatternBitMaskHelper_4_(pvSearch, cbSearch, pszPattern, pszMask, cbPattern);
 }
 
 inline UINT_PTR FileOffsetToRVA(PBYTE pBase, UINT_PTR offset)
 {
     PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)pBase;
-    PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)(pBase + pDosHeader->e_lfanew);
+    PIMAGE_NT_HEADERS64 pNtHeaders = (PIMAGE_NT_HEADERS64)(pBase + pDosHeader->e_lfanew);
     PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNtHeaders);
     for (int i = 0; i < pNtHeaders->FileHeader.NumberOfSections; i++, pSection++)
     {
@@ -972,7 +1370,7 @@ inline UINT_PTR FileOffsetToRVA(PBYTE pBase, UINT_PTR offset)
 inline UINT_PTR RVAToFileOffset(PBYTE pBase, UINT_PTR rva)
 {
     PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)pBase;
-    PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)(pBase + pDosHeader->e_lfanew);
+    PIMAGE_NT_HEADERS64 pNtHeaders = (PIMAGE_NT_HEADERS64)(pBase + pDosHeader->e_lfanew);
     PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNtHeaders);
     for (int i = 0; i < pNtHeaders->FileHeader.NumberOfSections; i++, pSection++)
     {
@@ -991,23 +1389,72 @@ inline HMODULE LoadGuiModule()
     return LoadLibraryExW(epGuiPath, NULL, LOAD_LIBRARY_AS_DATAFILE);
 }
 
+/*class DECLSPEC_UUID("7bd7ab1c-f2c5-60c2-8d00-c2e50336a954")
+StartLayoutFactory;*/
+
+DEFINE_GUID(CLSID_StartLayoutFactory, 0x7BD7AB1C, 0xF2C5, 0x60C2, 0x8D, 0x00, 0xC2, 0xE5, 0x03, 0x36, 0xA9, 0x54);
+
 inline BOOL DoesWindows10StartMenuExist()
 {
-    if (!IsWindows11())
-        return TRUE;
+    static BOOL s_tbWindows10StartMenuExists; // UNDEFINED, TRUE, FALSE
+    if (s_tbWindows10StartMenuExists == 0)
+    {
+        if (!IsWindows11())
+        {
+            s_tbWindows10StartMenuExists = 1;
+            return s_tbWindows10StartMenuExists;
+        }
 
-    wchar_t szPath[MAX_PATH];
-    GetWindowsDirectoryW(szPath, MAX_PATH);
-    wcscat_s(szPath, MAX_PATH, L"\\SystemApps\\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\\StartUI.dll");
-    if (FileExistsW(szPath))
-        return TRUE;
+        wchar_t szPath[MAX_PATH];
+        GetWindowsDirectoryW(szPath, MAX_PATH);
+        wcscat_s(szPath, MAX_PATH, L"\\SystemApps\\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\\StartUI.dll");
+        BOOL bRet = FileExistsW(szPath);
+        if (!bRet)
+        {
+            GetWindowsDirectoryW(szPath, MAX_PATH);
+            wcscat_s(szPath, MAX_PATH, L"\\SystemApps\\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\\StartUI_.dll");
+            bRet = FileExistsW(szPath);
+        }
 
-    GetWindowsDirectoryW(szPath, MAX_PATH);
-    wcscat_s(szPath, MAX_PATH, L"\\SystemApps\\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\\StartUI_.dll");
-    if (FileExistsW(szPath))
-        return TRUE;
+        if (bRet)
+        {
+            bRet = FALSE;
 
-    return FALSE;
+            HMODULE hStartTileData = LoadLibraryExW(L"StartTileData.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (hStartTileData)
+            {
+                typedef HRESULT (WINAPI *DllGetClassObject_t)(REFCLSID rclsid, REFIID riid, LPVOID* ppv);
+                DllGetClassObject_t pfnDllGetClassObject = (DllGetClassObject_t)GetProcAddress(hStartTileData, "DllGetClassObject");
+
+                if (pfnDllGetClassObject)
+                {
+#ifdef __cplusplus
+                    IClassFactory* pFactory;
+                    HRESULT hr = pfnDllGetClassObject(CLSID_StartLayoutFactory, IID_PPV_ARGS(&pFactory));
+                    if (SUCCEEDED(hr))
+                    {
+                        bRet = TRUE;
+                        pFactory->Release();
+                    }
+#else
+                    IClassFactory* pFactory;
+                    HRESULT hr = pfnDllGetClassObject(&CLSID_StartLayoutFactory, &IID_IClassFactory, (void**)&pFactory);
+                    if (SUCCEEDED(hr))
+                    {
+                        bRet = TRUE;
+                        pFactory->lpVtbl->Release(pFactory);
+                    }
+#endif
+                }
+
+                FreeLibrary(hStartTileData);
+            }
+        }
+
+        s_tbWindows10StartMenuExists = bRet ? 1 : 2;
+    }
+
+    return s_tbWindows10StartMenuExists == 1;
 }
 
 inline BOOL IsStockWindows10TaskbarAvailable()
@@ -1030,33 +1477,33 @@ inline const WCHAR* PickTaskbarDll()
      || b >= 18362 && b <= 18363 // Windows 10 1903, 1909
      || b >= 19041 && b <= 19045) // Windows 10 20H2, 21H2, 22H2
     {
-        return L"ep_taskbar.0.dll";
+        return L"ep_taskbar.rs2.dll";
+    }
+
+    if (b == 20348) // Windows Server 2022
+    {
+        return L"ep_taskbar.fe.dll";
     }
 
     if (b >= 21343 && b <= 22000) // Windows 11 21H2
     {
-        return L"ep_taskbar.1.dll";
+        return L"ep_taskbar.co.dll";
     }
 
-    if ((b >= 22621 && b <= 22635)  // 22H2-23H2 Release, Release Preview, and Beta channels
+    if ((b >= 22621 && b <= 22635)  // Windows 11 22H2-23H2 Release, Release Preview, and Beta channels
      || (b >= 23403 && b <= 25197)) // Early pre-reboot Dev channel until post-reboot Dev channel
     {
-        return L"ep_taskbar.2.dll";
+        return L"ep_taskbar.ni.dll";
     }
 
-    if (b >= 25201 && b <= 25915) // Pre-reboot Dev channel until early Canary channel, nuked ITrayComponentHost methods related to classic search box
+    if (b >= 25201 && b <= 25915) // Pre-reboot Dev channel until early Canary channel; Windows Server 23H2
     {
-        return L"ep_taskbar.3.dll";
+        return L"ep_taskbar.zn.dll";
     }
 
-    if (b >= 25921 && b <= 26040) // Canary channel with nuked classic system tray
+    if (b >= 25921) // Windows 11 24H2
     {
-        return L"ep_taskbar.4.dll";
-    }
-
-    if (b >= 26052) // Same as 4 but with 2 new methods in ITrayComponentHost between GetTrayUI and ProgrammableTaskbarReportClick
-    {
-        return L"ep_taskbar.5.dll";
+        return L"ep_taskbar.ge.dll";
     }
 
     return NULL;

@@ -831,13 +831,21 @@ BOOL DownloadResource(BOOL bInstall, LPCWSTR pwszURL, DWORD dwSize, LPCSTR chash
 
 void ProcessTaskbarDlls(BOOL* bInOutOk, BOOL bInstall, BOOL bExtractMode, HINSTANCE hInstance, unzFile zipFile, WCHAR wszPath[260])
 {
+    // Delete ep_taskbars with old naming scheme
+    DeleteResource(wszPath, L"ep_taskbar.0.dll");
+    DeleteResource(wszPath, L"ep_taskbar.1.dll");
+    DeleteResource(wszPath, L"ep_taskbar.2.dll");
+    DeleteResource(wszPath, L"ep_taskbar.3.dll");
+    DeleteResource(wszPath, L"ep_taskbar.4.dll");
+    DeleteResource(wszPath, L"ep_taskbar.5.dll");
+
     LPCWSTR pwszTaskbarDllName = bExtractMode ? NULL : PickTaskbarDll();
-    if (*bInOutOk) *bInOutOk = InstallResource(bInstall && (bExtractMode || pwszTaskbarDllName && !wcscmp(pwszTaskbarDllName, L"ep_taskbar.0.dll")), hInstance, zipFile, "ep_taskbar.0.dll", wszPath, L"ep_taskbar.0.dll");
-    if (*bInOutOk) *bInOutOk = InstallResource(bInstall && (bExtractMode || pwszTaskbarDllName && !wcscmp(pwszTaskbarDllName, L"ep_taskbar.1.dll")), hInstance, zipFile, "ep_taskbar.1.dll", wszPath, L"ep_taskbar.1.dll");
-    if (*bInOutOk) *bInOutOk = InstallResource(bInstall && (bExtractMode || pwszTaskbarDllName && !wcscmp(pwszTaskbarDllName, L"ep_taskbar.2.dll")), hInstance, zipFile, "ep_taskbar.2.dll", wszPath, L"ep_taskbar.2.dll");
-    if (*bInOutOk) *bInOutOk = InstallResource(bInstall && (bExtractMode || pwszTaskbarDllName && !wcscmp(pwszTaskbarDllName, L"ep_taskbar.3.dll")), hInstance, zipFile, "ep_taskbar.3.dll", wszPath, L"ep_taskbar.3.dll");
-    if (*bInOutOk) *bInOutOk = InstallResource(bInstall && (bExtractMode || pwszTaskbarDllName && !wcscmp(pwszTaskbarDllName, L"ep_taskbar.4.dll")), hInstance, zipFile, "ep_taskbar.4.dll", wszPath, L"ep_taskbar.4.dll");
-    if (*bInOutOk) *bInOutOk = InstallResource(bInstall && (bExtractMode || pwszTaskbarDllName && !wcscmp(pwszTaskbarDllName, L"ep_taskbar.5.dll")), hInstance, zipFile, "ep_taskbar.5.dll", wszPath, L"ep_taskbar.5.dll");
+    if (*bInOutOk) *bInOutOk = InstallResource(bInstall && (bExtractMode || pwszTaskbarDllName && !wcscmp(pwszTaskbarDllName, L"ep_taskbar.rs2.dll")), hInstance, zipFile, "ep_taskbar.rs2.dll", wszPath, L"ep_taskbar.rs2.dll");
+    if (*bInOutOk) *bInOutOk = InstallResource(bInstall && (bExtractMode || pwszTaskbarDllName && !wcscmp(pwszTaskbarDllName, L"ep_taskbar.fe.dll")), hInstance, zipFile, "ep_taskbar.fe.dll", wszPath, L"ep_taskbar.fe.dll");
+    if (*bInOutOk) *bInOutOk = InstallResource(bInstall && (bExtractMode || pwszTaskbarDllName && !wcscmp(pwszTaskbarDllName, L"ep_taskbar.co.dll")), hInstance, zipFile, "ep_taskbar.co.dll", wszPath, L"ep_taskbar.co.dll");
+    if (*bInOutOk) *bInOutOk = InstallResource(bInstall && (bExtractMode || pwszTaskbarDllName && !wcscmp(pwszTaskbarDllName, L"ep_taskbar.ni.dll")), hInstance, zipFile, "ep_taskbar.ni.dll", wszPath, L"ep_taskbar.ni.dll");
+    if (*bInOutOk) *bInOutOk = InstallResource(bInstall && (bExtractMode || pwszTaskbarDllName && !wcscmp(pwszTaskbarDllName, L"ep_taskbar.zn.dll")), hInstance, zipFile, "ep_taskbar.zn.dll", wszPath, L"ep_taskbar.zn.dll");
+    if (*bInOutOk) *bInOutOk = InstallResource(bInstall && (bExtractMode || pwszTaskbarDllName && !wcscmp(pwszTaskbarDllName, L"ep_taskbar.ge.dll")), hInstance, zipFile, "ep_taskbar.ge.dll", wszPath, L"ep_taskbar.ge.dll");
 }
 
 BOOL RemoveDirectoryRecursive(const WCHAR* wszDirectoryPath)
@@ -1322,7 +1330,7 @@ int WINAPI wWinMain(
             if (CHECK_OK(bOk)) bOk = InstallResource(bInstall, hInstance, zipFile, "WebView2Loader.dll", wszPath, L"WebView2Loader.dll");
         }
         ProcessTaskbarDlls(&bOk, bInstall, FALSE, hInstance, zipFile, wszPath);
-        const WCHAR* possibleDirs[] =
+        const WCHAR* const possibleDirs[] =
         {
             L"ar-SA", L"bg-BG", L"ca-ES", L"cs-CZ", L"da-DK", L"de-DE", L"el-GR", L"en-GB", L"en-US", L"es-ES",
             L"es-MX", L"et-EE", L"eu-ES", L"fi-FI", L"fr-CA", L"fr-FR", L"gl-ES", L"he-IL", L"hr-HR", L"hu-HU",

@@ -13,6 +13,9 @@ BOOL bInstanced = FALSE;
 BOOL g_bIsUsingOwnJumpViewUI = FALSE;
 BOOL g_bIsUsingOwnStartUI = FALSE;
 
+RTL_OSVERSIONINFOW global_rovi;
+DWORD32 global_ubr;
+
 DEFINE_GUID(IID_StartDocked_App, 0x4C2CAEAD, 0x9DA8, 0x30EC, 0xB6, 0xD3, 0xCB, 0xD5, 0x74, 0xED, 0xCB, 0x35); // 4C2CAEAD-9DA8-30EC-B6D3-CBD574EDCB35
 DEFINE_GUID(IID_StartUI_App, 0x1ECDC9E0, 0xBDB1, 0x3551, 0x8C, 0xEE, 0x4B, 0x77, 0x54, 0x0C, 0x44, 0xB3); // 1ECDC9E0-BDB1-3551-8CEE-4B77540C44B3
 DEFINE_GUID(IID_StartDocked_XamlMetaDataProvider, 0xD5783E97, 0x0462, 0x3A6B, 0xAA, 0x60, 0x50, 0x0D, 0xB1, 0x1D, 0x3E, 0xF6); // D5783E97-0462-3A6B-AA60-500DB11D3EF6
@@ -54,16 +57,29 @@ WCHAR g_szStartUIName[MAX_PATH];
 
 BOOL GetStartShowClassicMode()
 {
-    DWORD dwStartShowClassicMode = 0;
-    DWORD dwSize = sizeof(DWORD);
-    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", L"Start_ShowClassicMode", RRF_RT_DWORD, NULL, &dwStartShowClassicMode, &dwSize);
-    if (dwStartShowClassicMode == 0)
-        return FALSE;
+    static int s_tbStartShowClassicMode; // UNDEFINED, TRUE, FALSE
+    if (s_tbStartShowClassicMode == 0)
+    {
+        DWORD dwStartShowClassicMode = 0;
+        DWORD dwSize = sizeof(DWORD);
+        RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", L"Start_ShowClassicMode", RRF_RT_DWORD, NULL, &dwStartShowClassicMode, &dwSize);
 
-    if (!GetStartUIName(g_szStartUIName, ARRAYSIZE(g_szStartUIName)))
-        return FALSE;
+        s_tbStartShowClassicMode = dwStartShowClassicMode != 0
+            && DoesWindows10StartMenuExist()
+            && GetStartUIName(g_szStartUIName, ARRAYSIZE(g_szStartUIName)) ? 1 : 2;
+    }
 
-    return TRUE;
+    return s_tbStartShowClassicMode == 1;
+}
+
+BOOL SupportsStartShowClassicModeInVanilla()
+{
+    return IsWindows11() && (global_rovi.dwBuildNumber < 22000 || (global_rovi.dwBuildNumber == 22000 && global_ubr < 65));
+}
+
+BOOL ShouldPatch11StuffFor10StartMenu()
+{
+    return GetStartShowClassicMode() && !SupportsStartShowClassicModeInVanilla();
 }
 
 void PatchXamlMetaDataProviderGuid()
@@ -75,10 +91,9 @@ void PatchXamlMetaDataProviderGuid()
     }
     bPatched = TRUE;
 
-    PBYTE beginRData = NULL;
-    DWORD sizeRData = 0;
-    RDataSectionBeginAndSize(GetModuleHandleW(NULL), &beginRData, &sizeRData);
-    if (!beginRData || !sizeRData)
+    PBYTE beginRData;
+    DWORD sizeRData;
+    if (!RDataSectionBeginAndSize(GetModuleHandleW(NULL), &beginRData, &sizeRData))
     {
         return;
     }
@@ -99,7 +114,9 @@ void PatchXamlMetaDataProviderGuid()
 
 void Init()
 {
-    if (GetStartShowClassicMode())
+    InitializeGlobalVersionAndUBR();
+
+    if (ShouldPatch11StuffFor10StartMenu())
     {
         // VnPatchIAT(GetModuleHandleW(NULL), "api-ms-win-core-sysinfo-l1-2-0.dll", "GetProductInfo", start_GetProductInfo);
         PatchXamlMetaDataProviderGuid();
@@ -113,10 +130,9 @@ void Init()
             g_bIsUsingOwnJumpViewUI = TRUE;
         }
 
-        PBYTE beginText = NULL;
-        DWORD sizeText = 0;
-        TextSectionBeginAndSize(GetModuleHandleW(NULL), &beginText, &sizeText);
-        if (beginText && sizeText)
+        PBYTE beginText;
+        DWORD sizeText;
+        if (TextSectionBeginAndSize(GetModuleHandleW(NULL), &beginText, &sizeText))
         {
             // Fix 0x800704DA (The service is already registered) exception when feature flag 58205615 is enabled
             // Feature flag introduced in:
@@ -150,7 +166,7 @@ void Init()
             // TODO Improve pattern
             // 7F 23 03 D5 F3 53 BF A9 FD 7B BC A9 FD 03 00 91 30 00 80 92 B0 0F 00 F9
             // ----------- PACIBSP, don't scan for this because it's everywhere
-            PBYTE match = FindPattern(
+            PBYTE match = FindPattern_4_(
                 beginText,
                 sizeText,
                 "\xF3\x53\xBF\xA9\xFD\x7B\xBC\xA9\xFD\x03\x00\x91\x30\x00\x80\x92\xB0\x0F\x00\xF9",
@@ -221,7 +237,7 @@ HRESULT GetActivationFactoryByPCWSTR(PCWSTR activatableClassId, REFIID riid, voi
 
     if (!wcscmp(activatableClassId, L"StartDocked.App") && IsEqualGUID(riid, &IID_StartDocked_App))
     {
-        if (GetStartShowClassicMode())
+        if (ShouldPatch11StuffFor10StartMenu())
         {
             LoadOurShellCommonPri();
             return GetActivationFactoryByPCWSTR_InStartUI(L"StartUI.App", &IID_StartUI_App, ppv);
@@ -229,14 +245,17 @@ HRESULT GetActivationFactoryByPCWSTR(PCWSTR activatableClassId, REFIID riid, voi
     }
     else if (!wcscmp(activatableClassId, L"StartDocked.startdocked_XamlTypeInfo.XamlMetaDataProvider"))
     {
-        if (GetStartShowClassicMode())
+        if (ShouldPatch11StuffFor10StartMenu())
         {
             return GetActivationFactoryByPCWSTR_InStartUI(L"StartUI.startui_XamlTypeInfo.XamlMetaDataProvider", riid, ppv);
         }
     }
     else if (wcsncmp(activatableClassId, L"StartUI.", 8) == 0)
     {
-        return GetActivationFactoryByPCWSTR_InStartUI(activatableClassId, riid, ppv);
+        if (ShouldPatch11StuffFor10StartMenu())
+        {
+            return GetActivationFactoryByPCWSTR_InStartUI(activatableClassId, riid, ppv);
+        }
     }
     else if (wcsncmp(activatableClassId, L"JumpViewUI.", 11) == 0)
     {

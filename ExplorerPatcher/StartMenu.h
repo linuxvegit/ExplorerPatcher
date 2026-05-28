@@ -6,8 +6,6 @@
 #include <Shlwapi.h>
 #pragma comment(lib, "Shlwapi.lib")
 #include <TlHelp32.h>
-#include <Psapi.h>
-#pragma comment(lib, "Psapi.lib")
 #include <roapi.h>
 #include <winstring.h>
 #include "utility.h"
@@ -40,6 +38,12 @@ DEFINE_GUID(IID_IImmersiveLauncher10RS,
     0xd8d60399,
     0xa0f1, 0xf987, 0x55, 0x51,
     0x32, 0x1f, 0xd1, 0xb4, 0x98, 0x64
+);
+
+DEFINE_GUID(IID_WindowsUdk_UI_Shell_ITaskbarSettings3,
+    0x7153B486,
+    0x6827, 0x58DC, 0xB8, 0x73,
+    0xF9, 0xB3, 0x8C, 0x15, 0x5C, 0xF2
 );
 
 DEFINE_GUID(IID_WindowsUdk_UI_Shell_ITaskbarSettings6,

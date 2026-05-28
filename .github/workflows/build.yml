@@ -8,15 +8,7 @@ name: Build
 
 on:
   push:
-    branches:
-      - '**'
-    tags-ignore:
-      - '**'
   pull_request:
-    branches:
-      - '**'
-    tags-ignore:
-      - '**'
   workflow_dispatch:
     inputs:
       ref:
@@ -33,27 +25,34 @@ env:
   SOLUTION_FILE_PATH: .
   BUILD_CONFIGURATION: Release
 
+permissions:
+  contents: write
+
 jobs:
   build:
-    runs-on: windows-2025
-
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
     steps:
       - name: Print inputs
         shell: bash
         run: |
-          echo "ref: ${{ github.event.inputs.ref }}"
-          echo "config: ${{ github.event.inputs.config }}"
-          echo "build_dir: ${{ github.event.inputs.build_dir }}"
+          echo "ref: ${GITHUB_EVENT_INPUTS_REF}"
+          echo "config: ${GITHUB_EVENT_INPUTS_CONFIG}"
+          echo "build_dir: ${GITHUB_EVENT_INPUTS_BUILD_DIR}"
+        env:
+          GITHUB_EVENT_INPUTS_REF: ${{ github.event.inputs.ref }}
+          GITHUB_EVENT_INPUTS_CONFIG: ${{ github.event.inputs.config }}
+          GITHUB_EVENT_INPUTS_BUILD_DIR: ${{ github.event.inputs.build_dir }}
 
       - name: Checkout latest build and submodules
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         if: github.event.inputs.ref == ''
         with:
           submodules: recursive
           persist-credentials: false
 
       - name: Checkout specific build and submodules
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         if: github.event.inputs.ref != ''
         with:
           ref: ${{ github.event.inputs.ref }}
@@ -61,14 +60,13 @@ jobs:
           persist-credentials: false
 
       - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
 
       - name: Declare some variables
         id: vars
         shell: bash
         run: |
-          echo "branch=$(echo ${GITHUB_REF#refs/heads/})" >> $GITHUB_OUTPUT
-          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "sha_short=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
       - name: Enable SimpleWindowSwitcher support for newer Windows SDKs
         shell: cmd
@@ -82,7 +80,9 @@ jobs:
           exit /b 0
 
       - name: Setup NuGet
-        uses: nuget/setup-nuget@v2
+        uses: nuget/setup-nuget@fd55a6f3b34392fa83fde1454582407d8c714123 # v4.0
+        with:
+          nuget-version: '7.x'
 
       - name: Restore NuGet packages
         run: |
@@ -94,7 +94,7 @@ jobs:
           BuildDependencies%BUILD_CONFIGURATION%.bat
 
       - name: Download ep_taskbar
-        uses: robinraju/release-downloader@v1
+        uses: robinraju/release-downloader@28fc21f50d76778e7023361aa1f863e717d3d56f # v1.13
         with:
           repository: ExplorerPatcher/ep_taskbar_releases
           fileName: ep_taskbar.*.dll
@@ -112,7 +112,7 @@ jobs:
               mv "$file" "build/Release/x64/$(basename "$file" .amd64.dll).dll"
             done
           fi
-          
+
           if ls build/Release/ep_taskbar.*.arm64.dll 1> /dev/null 2>&1; then
             mkdir -p build/Release/ARM64
             for file in build/Release/ep_taskbar.*.arm64.dll; do
@@ -120,36 +120,40 @@ jobs:
             done
           fi
 
-      - name: Build EP IA-32
+      - name: Build ExplorerPatcher (IA-32)
         if: github.event.inputs.config == ''
         working-directory: ${{env.GITHUB_WORKSPACE}}
         run: |
           msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=IA-32 ${{env.SOLUTION_FILE_PATH}}
 
-      - name: Build EP amd64
+      - name: Build ExplorerPatcher (amd64)
         if: github.event.inputs.config == ''
         working-directory: ${{env.GITHUB_WORKSPACE}}
         run: |
           msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=amd64 ${{env.SOLUTION_FILE_PATH}}
 
-      - name: Build EP arm64
+      - name: Build ExplorerPatcher (arm64)
         if: github.event.inputs.config == ''
         working-directory: ${{env.GITHUB_WORKSPACE}}
         run: |
           msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=arm64 /p:WithArm64XBinaries=true ${{env.SOLUTION_FILE_PATH}}
 
-      - name: Build EP custom
+      - name: Build ExplorerPatcher (Custom Build)
         if: github.event.inputs.config != ''
         working-directory: ${{env.GITHUB_WORKSPACE}}
         run: |
-          msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=${{ github.event.inputs.config }} ${{env.SOLUTION_FILE_PATH}}
+          msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} /p:Platform=$env:GITHUB_EVENT_INPUTS_CONFIG ${{env.SOLUTION_FILE_PATH}}
+        env:
+          GITHUB_EVENT_INPUTS_CONFIG: ${{ github.event.inputs.config }}
 
       - name: Create expected build directory
         if: github.event.inputs.build_dir != ''
         shell: bash
         run: |
           mkdir build
-          cp -r ${{ github.event.inputs.build_dir }}/Release build/Release
+          cp -r ${GITHUB_EVENT_INPUTS_BUILD_DIR}/Release build/Release
+        env:
+          GITHUB_EVENT_INPUTS_BUILD_DIR: ${{ github.event.inputs.build_dir }}
 
       - name: Generate dxgi.dll
         shell: bash
@@ -182,16 +186,18 @@ jobs:
           rm -f build/Release/ARM64/ep_setup_files.zip.bin
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ep_bin_multi_${{ steps.vars.outputs.sha_short }}_${{ steps.vars.outputs.branch }}
+          name: ep_bin_multi_${{ steps.vars.outputs.sha_short }}_${{ github.ref_name }}
           path: |
             build/Release/
+          if-no-files-found: error
 
       # build/Release/x64/ep_setup.exe -> build/Release/ep_setup.exe
       # build/Release/ARM64/ep_setup.exe -> build/Release/ep_setup_arm64.exe
       - name: Stage files for release
-        if: github.ref == 'refs/heads/master' && github.event.inputs.ref == ''
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         shell: bash
         run: |
           if [ -d "build/Release/x64" ] && ls build/Release/x64/ep_setup.exe 1> /dev/null 2>&1; then
@@ -204,7 +210,7 @@ jobs:
       - name: Generate release name
         shell: bash
         working-directory: build/Release/x64
-        if: github.ref == 'refs/heads/master' && github.event.inputs.ref == ''
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: |
           echo "data=$(./ep_generate_release_name.exe)" >> $GITHUB_OUTPUT
         id: release_name
@@ -212,41 +218,41 @@ jobs:
       - name: Generate release notes
         shell: bash
         working-directory: build/Release/x64
-        if: github.ref == 'refs/heads/master' && github.event.inputs.ref == ''
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: |
           echo "data<<EP_RELEASE_DESCRIPTION_DELIM" >> $GITHUB_OUTPUT
-          echo "$(./ep_generate_release_description.exe ${{ steps.vars.outputs.sha_short }} ${{ steps.vars.outputs.branch }} ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_OUTPUT
+          echo "$(./ep_generate_release_description.exe ${STEPS_VARS_OUTPUTS_SHA_SHORT} ${{ github.ref_type }} ${{ github.ref_name }} ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_OUTPUT
           echo "EP_RELEASE_DESCRIPTION_DELIM" >> $GITHUB_OUTPUT
         id: release_description
+        env:
+          STEPS_VARS_OUTPUTS_SHA_SHORT: ${{ steps.vars.outputs.sha_short }}
 
       - name: Create/update release (valinet)
-        uses: softprops/action-gh-release@v2
-        if: github.repository_owner == 'valinet' && github.ref == 'refs/heads/master' && github.event.inputs.ref == ''
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        if: github.repository_owner == 'valinet' && github.event_name == 'push' && github.ref_type == 'tag'
         id: create_release
         with:
           draft: false
           prerelease: ${{ !startsWith(github.event.head_commit.message, 'rel_') }}
           name: ${{ steps.release_name.outputs.data }}
-          tag_name: ${{ steps.release_name.outputs.data }}_${{ steps.vars.outputs.sha_short }}
+          tag_name: ${{ github.ref_name }}
           body: ${{ steps.release_description.outputs.data }}
           files: |
             build/Release/ep_setup.exe
             build/Release/ep_setup_arm64.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT }}
+          token: ${{ secrets.PAT }}
 
       - name: Create/update release (forks)
-        uses: softprops/action-gh-release@v2
-        if: github.repository_owner != 'valinet' && github.ref == 'refs/heads/master' && github.event.inputs.ref == ''
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        if: github.repository_owner != 'valinet' && github.event_name == 'push' && github.ref_type == 'tag'
         id: create_release_fork
         with:
           draft: false
           prerelease: ${{ !startsWith(github.event.head_commit.message, 'rel_') }}
           name: ${{ steps.release_name.outputs.data }}
-          tag_name: ${{ steps.release_name.outputs.data }}_${{ steps.vars.outputs.sha_short }}
+          tag_name: ${{ github.ref_name }}
           body: ${{ steps.release_description.outputs.data }}
           files: |
             build/Release/ep_setup.exe
             build/Release/ep_setup_arm64.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
